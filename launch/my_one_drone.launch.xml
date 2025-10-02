@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<launch>
+  
+  <executable cmd = "ign gazebo -r $(find-pkg-share swarm_drones)/worlds/one_quadrotor_world.sdf"/>
+  
+  <arg name="arg1" default="/r1/gazebo/command/twist@geometry_msgs/msg/Twist]ignition.msgs.Twist"/>
+  <arg name="arg2" default="/model/r1/odometry@nav_msgs/msg/Odometry[ignition.msgs.Odometry"/>
+  <node pkg="ros_gz_bridge" exec="parameter_bridge" args="$(var arg1) $(var arg2)">
+    <remap from="/r1/gazebo/command/twist" to="/r1/cmd_vel"/>
+    <remap from="/model/r1/odometry" to="/r1/odom"/>
+  </node>
+  
+  <let name= "rviz_config_path" value="$(find-pkg-share swarm_drones)/rviz/my_one_drone.rviz"/>
+  <node pkg="rviz2" exec="rviz2" args="-d $(var rviz_config_path)" />
+  
+  <arg name="urdf_path" default="$(find-pkg-share swarm_drones)/urdf/r1.xacro"/>
+  <node pkg="robot_state_publisher" exec="robot_state_publisher" >
+    <param name="robot_description" value="$(command 'xacro $(var urdf_path)')"/>
+  </node>
+  
+</launch> 
