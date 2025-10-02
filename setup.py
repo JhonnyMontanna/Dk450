@@ -23,9 +23,6 @@ setup(
     entry_points={
         'console_scripts': [
             'MavlinkVisualizer = dk450.MavlinkVisualizer:main',
-            'virtual_leader = dk450.virtual_leader:main',
-            'drone_seguidor = dk450.drone_seguidor:main',
-            'Control_Circulo = dk450.Control_Circulo:main',
             'MavrosVisualizer = dk450.MavrosVisualizer:main',
             'Mavros_Circulo = dk450.Mavros_Circulo:main',
             'Mavros_Takeoff = dk450.Mavros_Takeoff:main',
