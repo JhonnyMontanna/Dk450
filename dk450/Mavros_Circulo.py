@@ -17,16 +17,16 @@ class CircleRTKSequenceStopThenGoto(Node):
 
         p = self.declare_parameter
         # misión / control
-        p('drone_ns', 'uav1')
+        p('drone_ns', 'uav2')
         p('radius', 2.0)
-        p('angular_speed', 0.8)
+        p('angular_speed', 0.4)
         p('rate', 20)
-        p('loops', 1)
+        p('loops', 4)
         p('kp', 0.8)               # controlador radial durante círculo
         p('goto_kp', 0.8)         # P para goto (lineal)
         p('max_speed', 2.0)
-        p('goto_tol', 0.2)
-        p('center_tol', 0.2)
+        p('goto_tol', 0.01)
+        p('center_tol', 0.01)
         # nuevo: tolerancia para parar en el punto final del perímetro
         p('end_tol', 0.15)
         p('hold_time_after_stop', 1.0)  # segundos que espera parado en end_point antes de goto_center
