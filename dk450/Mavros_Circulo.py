@@ -11,12 +11,12 @@ from sensor_msgs.msg import NavSatFix
 WGS84_A  = 6378137.0
 WGS84_E2 = 6.69437999014e-3
 
-class CircleRTKSequence(Node):
+class CircleRTKSequenceStopThenGoto(Node):
     def __init__(self):
-        super().__init__('circle_rtk_sequence')
+        super().__init__('circle_rtk_sequence_stop_goto')
 
         p = self.declare_parameter
-        # misión
+        # misión / control
         p('drone_ns', 'uav1')
         p('radius', 2.0)
         p('angular_speed', 0.8)
@@ -27,6 +27,9 @@ class CircleRTKSequence(Node):
         p('max_speed', 2.0)
         p('goto_tol', 0.2)
         p('center_tol', 0.2)
+        # nuevo: tolerancia para parar en el punto final del perímetro
+        p('end_tol', 0.15)
+        p('hold_time_after_stop', 1.0)  # segundos que espera parado en end_point antes de goto_center
 
         # RTK origin & calib (mantén los tuyos)
         p('origin_lat', 19.5942341); p('origin_lon', -99.2280871); p('origin_alt', 2329.0)
@@ -46,18 +49,21 @@ class CircleRTKSequence(Node):
         self.max_speed = float(self.get_parameter('max_speed').value)
         self.goto_tol = float(self.get_parameter('goto_tol').value)
         self.center_tol = float(self.get_parameter('center_tol').value)
+        self.end_tol = float(self.get_parameter('end_tol').value)
+        self.hold_time_after_stop = float(self.get_parameter('hold_time_after_stop').value)
 
-        # RTK
+        self.calib_mode = self.get_parameter('calib_mode').value
+        self.calib_ang = float(self.get_parameter('calib_ang').value)
+        self.expected_local_x = float(self.get_parameter('expected_local_x').value)
+        self.expected_local_y = float(self.get_parameter('expected_local_y').value)
+
+        # RTK precalc
         o_lat = self.get_parameter('origin_lat').value
         o_lon = self.get_parameter('origin_lon').value
         o_alt = self.get_parameter('origin_alt').value
         c_lat = self.get_parameter('calib_lat').value
         c_lon = self.get_parameter('calib_lon').value
         c_alt = self.get_parameter('calib_alt').value
-        self.calib_mode = self.get_parameter('calib_mode').value
-        self.calib_ang = float(self.get_parameter('calib_ang').value)
-        self.expected_local_x = float(self.get_parameter('expected_local_x').value)
-        self.expected_local_y = float(self.get_parameter('expected_local_y').value)
 
         self.lat0 = math.radians(o_lat); self.lon0 = math.radians(o_lon)
         self.lat_ref = math.radians(c_lat); self.lon_ref = math.radians(c_lon)
@@ -68,13 +74,15 @@ class CircleRTKSequence(Node):
         self.calib_mode = self.calib_mode if self.calib_mode in ('enu','angle','pair') else 'pair'
         self.theta_cal = self.compute_theta()
 
-        # estado
+        # estados
         self.home = None          # home ENU [x,y]
         self.current = None       # current ENU [x,y]
         self.start_point = None   # punto inicial del perímetro [x,y]
-        self.state = 'wait_home'  # 'wait_home'|'goto_start'|'circle'|'return_home'|'done'
+        self.state = 'wait_home'  # 'wait_home'|'goto_start'|'circle'|'stop_end'|'goto_center'|'done'
         self.theta_phase = 0.0
         self.total_theta = 0.0
+        self.end_point = None     # punto final en perímetro calculado al terminar círculo
+        self._stop_start_time = None
 
         self.dt = 1.0 / float(self.rate)
 
@@ -98,19 +106,16 @@ class CircleRTKSequence(Node):
         yr = enu[0]*math.sin(self.theta_cal) + enu[1]*math.cos(self.theta_cal)
         self.current = [float(xr), float(yr)]
         if self.home is None:
-            # fijar home en la primera lectura
+            # fijar home y start_point la primera vez que tengamos lectura
             self.home = [float(xr), float(yr)]
-            # definir start point en (0, R) relativo a home: interpretamos (0,R) como offset en Y local
             self.start_point = [self.home[0] + 0.0, self.home[1] + self.R]
             self.get_logger().info(f"Home fijado: {self.home} | Start_point (0,R): {self.start_point}")
-            # cambiar inmediatamente a goto_start
             self.state = 'goto_start'
 
-    # ---------- Controladores ----------
+    # ---------- Publicar comandos ----------
     def publish_cmd(self, vx, vy):
-        # saturación
         mag = math.hypot(vx, vy)
-        if mag > self.max_speed:
+        if mag > self.max_speed and mag > 0.0:
             s = self.max_speed / mag
             vx *= s; vy *= s
         t = Twist(); t.linear.x = float(vx); t.linear.y = float(vy); t.linear.z = 0.0; t.angular.z = 0.0
@@ -118,12 +123,13 @@ class CircleRTKSequence(Node):
         ts = TwistStamped(); ts.header.stamp = self.get_clock().now().to_msg(); ts.twist = t
         self.pub_ts.publish(ts)
 
+    # ---------- Bucle de control ----------
     def control_loop(self):
         if self.current is None or self.home is None:
             return
 
+        # --- goto_start ---
         if self.state == 'goto_start':
-            # control P simple hacia start_point
             tx, ty = self.start_point
             cx, cy = self.current
             ex, ey = tx - cx, ty - cy
@@ -131,19 +137,16 @@ class CircleRTKSequence(Node):
             vx = self.goto_kp * ex
             vy = self.goto_kp * ey
             self.publish_cmd(vx, vy)
-            # condición de llegada
             if dist <= self.goto_tol:
                 self.get_logger().info(f"Llegó a start_point (dist={dist:.3f}). Iniciando círculo.")
-                # fijar fase para comenzar en (0,R) con θ = π/2
                 self.theta_phase = math.pi/2.0
                 self.total_theta = 0.0
                 self.state = 'circle'
-                # publicar unos zeros cortos antes de empezar para estabilizar
                 self.publish_zeroes(int(self.rate * 0.05))
             return
 
+        # --- circle ---
         if self.state == 'circle':
-            # avanzar fase
             dtheta = self.omega * self.dt
             self.theta_phase += dtheta
             self.total_theta += dtheta
@@ -152,7 +155,6 @@ class CircleRTKSequence(Node):
             tx = cx + self.R * math.cos(self.theta_phase)
             ty = cy + self.R * math.sin(self.theta_phase)
 
-            # feedforward tangential
             vff_x = - self.R * self.omega * math.sin(self.theta_phase)
             vff_y =   self.R * self.omega * math.cos(self.theta_phase)
 
@@ -168,13 +170,44 @@ class CircleRTKSequence(Node):
             self.publish_cmd(cmd_x, cmd_y)
 
             if self.total_theta >= 2.0 * math.pi * self.loops:
-                self.get_logger().info("Vueltas completadas. Iniciando retorno a home.")
-                self.state = 'return_home'
+                # calcular end_point en el perímetro (posición objetivo donde nos queremos detener)
+                end_tx = cx + self.R * math.cos(self.theta_phase)
+                end_ty = cy + self.R * math.sin(self.theta_phase)
+                self.end_point = [float(end_tx), float(end_ty)]
+                self.get_logger().info(f"Vueltas completadas. End_point={self.end_point}. Cambiando a 'stop_end'.")
+                self.state = 'stop_end'
+                self._stop_start_time = None
+                # publicar zeros para marcar transición
                 self.publish_zeroes(int(self.rate * 0.05))
             return
 
-        if self.state == 'return_home':
-            # P hacia home
+        # --- stop_end: detenerse en el punto final del perímetro ---
+        if self.state == 'stop_end':
+            tx, ty = self.end_point
+            cx, cy = self.current
+            ex, ey = tx - cx, ty - cy
+            dist = math.hypot(ex, ey)
+            # usar un P pequeño para "centering" suave si está lejano; si muy cerca publicar zeros
+            if dist > self.end_tol:
+                vx = self.goto_kp * ex
+                vy = self.goto_kp * ey
+                self.publish_cmd(vx, vy)
+                # no iniciar el temporizador hasta que esté dentro de end_tol
+                return
+            else:
+                # estamos suficientemente cerca: empezar a contar hold time y publicar zeros
+                if self._stop_start_time is None:
+                    self._stop_start_time = time.time()
+                    self.get_logger().info(f"Detenido en end_point dentro de end_tol={self.end_tol}. Esperando {self.hold_time_after_stop}s antes de ir al centro.")
+                # publicar zeros mientras espera
+                self.publish_cmd(0.0, 0.0)
+                if time.time() - self._stop_start_time >= self.hold_time_after_stop:
+                    self.get_logger().info("Hold completo. Iniciando 'goto_center'.")
+                    self.state = 'goto_center'
+            return
+
+        # --- goto_center: ir desde end_point (detenido) al home ---
+        if self.state == 'goto_center':
             tx, ty = self.home
             cx, cy = self.current
             ex, ey = tx - cx, ty - cy
@@ -183,13 +216,13 @@ class CircleRTKSequence(Node):
             vy = self.goto_kp * ey
             self.publish_cmd(vx, vy)
             if dist <= self.center_tol:
-                self.get_logger().info(f"Home alcanzado (dist={dist:.3f}). Parando.")
+                self.get_logger().info(f"Home alcanzado (dist={dist:.3f}). Parando y finalizando.")
                 self.publish_zeroes(int(self.rate * 0.2))
                 self.state = 'done'
             return
 
+        # --- done ---
         if self.state == 'done':
-            # ya detenido; publicar zeros por seguridad
             self.publish_cmd(0.0, 0.0)
             return
 
@@ -234,7 +267,7 @@ class CircleRTKSequence(Node):
 
 def main():
     rclpy.init()
-    node = CircleRTKSequence()
+    node = CircleRTKSequenceStopThenGoto()
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
