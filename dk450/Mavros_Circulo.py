@@ -1,222 +1,225 @@
 #!/usr/bin/env python3
 import math
 import time
+import numpy as np
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, PoseStamped
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+from geometry_msgs.msg import Twist, TwistStamped
+from sensor_msgs.msg import NavSatFix
 
-class MavrosCircleClosedLoop(Node):
+# Usar las mismas constantes WGS84 que tu visualizador (orden de magnitud correcto)
+WGS84_A  = 6378137.0
+WGS84_E2 = 6.69437999014e-3
+
+class CircleRTKAccurate(Node):
     def __init__(self):
-        super().__init__('mavros_circle_closed_loop')
+        super().__init__('circle_rtk_accurate')
 
-        # Parámetros base (los tuyos más algunos para el controlador)
-        self.declare_parameter('drone_ns', 'uav1')
-        self.declare_parameter('radius', 2.0)           # m
-        self.declare_parameter('angular_speed', 1.0)    # rad/s (ω)
-        self.declare_parameter('rate', 50)              # Hz (control rate)
-        self.declare_parameter('loops', 1)              # vueltas completas
-        self.declare_parameter('Kp', 1.8)               # P para controlador de posición
-        self.declare_parameter('Kd', 0.3)               # D para controlador de posición
-        self.declare_parameter('max_speed', 3.0)        # límite en m/s para vx,vy
-        self.declare_parameter('center_tolerance', 0.2) # m, tolerancia para "volver al centro"
-        self.declare_parameter('pose_topic', 'mavros/local_position/pose') # relativo al namespace
+        p = self.declare_parameter
+        # Dinámica / misión
+        p('drone_ns', 'uav1')
+        p('radius', 2.0)
+        p('angular_speed', 0.8)
+        p('rate', 20)
+        p('loops', 1)
+        p('kp', 0.8)
+        p('max_speed', 3.0)
+        p('center_tolerance', 0.2)
 
-        ns       = self.get_parameter('drone_ns').value
-        self.R   = float(self.get_parameter('radius').value)
+        # RTK origin & calibration (usar los tuyos)
+        p('origin_lat', 19.5942341); p('origin_lon', -99.2280871); p('origin_alt', 2329.0)
+        p('calib_lat', 19.5942429);  p('calib_lon', -99.2280774);  p('calib_alt', 2329.0)
+        p('calib_mode', 'pair')   # 'enu'|'angle'|'pair'
+        p('calib_ang', 180.0)     # deg si mode=='angle'
+        p('expected_local_x', 1.0); p('expected_local_y', 1.0)
+
+        # leer params
+        self.ns = self.get_parameter('drone_ns').value
+        self.R  = float(self.get_parameter('radius').value)
         self.omega = float(self.get_parameter('angular_speed').value)
         self.rate  = int(self.get_parameter('rate').value)
         self.loops = int(self.get_parameter('loops').value)
-
-        self.Kp = float(self.get_parameter('Kp').value)
-        self.Kd = float(self.get_parameter('Kd').value)
+        self.kp = float(self.get_parameter('kp').value)
         self.max_speed = float(self.get_parameter('max_speed').value)
-        self.center_tolerance = float(self.get_parameter('center_tolerance').value)
-        pose_topic = f'/{ns}/{self.get_parameter("pose_topic").value}'
+        self.center_tol = float(self.get_parameter('center_tolerance').value)
+        self.calib_mode = self.get_parameter('calib_mode').value
+        self.calib_ang  = float(self.get_parameter('calib_ang').value)
+        self.expected_local_x = float(self.get_parameter('expected_local_x').value)
+        self.expected_local_y = float(self.get_parameter('expected_local_y').value)
 
-        assert self.R > 0.0, "radius debe ser > 0"
-        assert self.omega > 0.0, "angular_speed debe ser > 0"
-        assert self.rate > 0, "rate debe ser > 0"
-        assert self.loops >= 1, "loops debe ser >= 1"
+        # RTK origin & calib
+        o_lat = self.get_parameter('origin_lat').value
+        o_lon = self.get_parameter('origin_lon').value
+        o_alt = self.get_parameter('origin_alt').value
+        c_lat = self.get_parameter('calib_lat').value
+        c_lon = self.get_parameter('calib_lon').value
+        c_alt = self.get_parameter('calib_alt').value
 
-        # feedforward tangential speed (magnitud)
-        self.v_ff = self.R * self.omega
+        # convert to radians where required
+        self.lat0 = math.radians(o_lat); self.lon0 = math.radians(o_lon)
+        self.lat_ref = math.radians(c_lat); self.lon_ref = math.radians(c_lon)
 
-        # Otras variables internas
-        self.dt = 1.0 / self.rate
-        self.theta = 0.0                # fase actual del setpoint sobre el círculo
-        self.total_theta = 0.0          # para contar vueltas
-        self.center = None              # (x,y,z) fijado en la primera pose recibida
-        self.pose = None                # pose actual (x,y,z)
-        self.last_error = (0.0, 0.0)    # para D
-        self.finished_circle = False
-        self.returning_to_center = False
+        # ECEF & ENU precalc (definitivo)
+        self.X0, self.Y0, self.Z0 = self.geodetic_to_ecef(self.lat0, self.lon0, o_alt)
+        self.Xr, self.Yr, self.Zr = self.geodetic_to_ecef(self.lat_ref, self.lon_ref, c_alt)
+        self.R_enu = self.get_rotation_matrix(self.lat0, self.lon0)
 
-        # Publicador de velocidad (mavros setpoint topic)
-        vel_topic = f'/{ns}/setpoint_velocity/cmd_vel_unstamped'
-        self.pub = self.create_publisher(Twist, vel_topic, 10)
+        # compute theta using same logic que tu visualizer
+        self.calib_mode = self.calib_mode if self.calib_mode in ('enu','angle','pair') else 'pair'
+        self.theta = self.compute_theta()
 
-        # Subscriber a la pose local (PoseStamped). Ajusta el topic si tu stack usa otro.
-        self.sub_pose = self.create_subscription(
-            PoseStamped, pose_topic, self.pose_callback, 10
-        )
+        # estado
+        self.center = None       # [x,y] ENU local (rotado) fijado en primera lectura
+        self.current = None      # [x,y]
+        self.theta_phase = 0.0
+        self.total_theta = 0.0
+        self.returning = False
 
-        # Timer: controlador cerrado en rate
-        self.timer = self.create_timer(self.dt, self.control_loop)
+        self.dt = 1.0 / float(self.rate)
 
-        self.get_logger().info(
-            f"🌀 Nodo círculo cerrado [{ns}]: R={self.R} m, ω={self.omega} rad/s, "
-            f"v_ff={self.v_ff:.3f} m/s, rate={self.rate} Hz, loops={self.loops}, "
-            f"Kp={self.Kp}, Kd={self.Kd}, max_speed={self.max_speed}"
-        )
+        # qos
+        gps_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
-        # Timeout: si no llega pose en X segundos avisamos y salimos limpio
-        self.pose_wait_start = time.time()
-        self.pose_wait_timeout = 5.0  # segundos
+        # topics (igual que tu visualizer)
+        pose_topic = f'/{self.ns}/global_position/global'
+        self.create_subscription(NavSatFix, pose_topic, self.cb_navsat, gps_qos)
 
-    def pose_callback(self, msg: PoseStamped):
-        x = msg.pose.position.x
-        y = msg.pose.position.y
-        z = msg.pose.position.z
-        self.pose = (x, y, z)
+        # publishers de velocidad (match a tu stack)
+        self.pub_twist = self.create_publisher(Twist, f'/{self.ns}/setpoint_velocity/cmd_vel_unstamped', 10)
+        self.pub_ts = self.create_publisher(TwistStamped, f'/{self.ns}/mavros/setpoint_velocity/cmd_vel', 10)
 
-        # Si aún no tenemos centro, fijarlo en la primera pose recibida
+        # timer
+        self.create_timer(self.dt, self.control_loop)
+
+        self.get_logger().info(f"[INIT] {self.ns} R={self.R} ω={self.omega} theta_cal={math.degrees(self.theta):.2f}°")
+
+    # --- Callbacks ---
+    def cb_navsat(self, msg: NavSatFix):
+        # convert geodetic -> ECEF -> ENU -> rotate by theta (RTK local)
+        lat_r = math.radians(msg.latitude); lon_r = math.radians(msg.longitude); alt = msg.altitude
+        Xe, Ye, Ze = self.geodetic_to_ecef(lat_r, lon_r, alt)
+        d = np.array([Xe - self.X0, Ye - self.Y0, Ze - self.Z0])
+        enu = self.R_enu.dot(d)
+        xr = enu[0]*math.cos(self.theta) - enu[1]*math.sin(self.theta)
+        yr = enu[0]*math.sin(self.theta) + enu[1]*math.cos(self.theta)
+
+        self.current = [float(xr), float(yr)]
         if self.center is None:
-            self.center = (x, y, z)
-            self.get_logger().info(f"📍 Centro fijado en la posición inicial: x={x:.3f}, y={y:.3f}, z={z:.3f}")
+            self.center = [float(xr), float(yr)]
+            self.get_logger().info(f"Centro fijado en ENU: {self.center}")
 
+    # --- Control loop ---
     def control_loop(self):
-        # Si no hay pose aún, chequear timeout
-        if self.pose is None:
-            if time.time() - self.pose_wait_start > self.pose_wait_timeout:
-                self.get_logger().error("⏱️ No se recibió pose en el tiempo límite. Publicando zeros y apagando timer.")
-                self.publish_zero_times(10)
-                rclpy.shutdown()
+        if self.current is None or self.center is None:
             return
 
-        # Si no hay centro (no se ejecuta por seguridad), esperar
-        if self.center is None:
-            return
-
-        # Si ya completó el círculo y regresó al centro, detener todo
-        if self.finished_circle and self.returning_to_center is False:
-            # activar fase de regreso al centro
-            self.get_logger().info("🔁 Círculos completados: iniciando regreso al centro.")
-            self.returning_to_center = True
-
-        # Si estamos en fase de trazar el círculo
-        if not self.returning_to_center:
-            # avanzar theta según ω*dt (evita drift con timestamp real)
+        if not self.returning:
             dtheta = self.omega * self.dt
-            self.theta += dtheta
+            self.theta_phase += dtheta
             self.total_theta += dtheta
 
-            # calcular setpoint en el perímetro
-            cx, cy, cz = self.center
-            target_x = cx + self.R * math.cos(self.theta)
-            target_y = cy + self.R * math.sin(self.theta)
-            target_z = cz  # mantener altura constante (puedes cambiar)
+            cx, cy = self.center
+            tx = cx + self.R * math.cos(self.theta_phase)
+            ty = cy + self.R * math.sin(self.theta_phase)
 
-            # feedforward tangential velocity (derivada del parámetro)
-            # derivada de [R cos, R sin] = R * ω * [-sin, cos]
-            v_ff_x = - self.R * self.omega * math.sin(self.theta)
-            v_ff_y =   self.R * self.omega * math.cos(self.theta)
+            # feedforward tangential:
+            vff_x = - self.R * self.omega * math.sin(self.theta_phase)
+            vff_y =   self.R * self.omega * math.cos(self.theta_phase)
 
-            # error de posición
-            cur_x, cur_y, cur_z = self.pose
-            err_x = target_x - cur_x
-            err_y = target_y - cur_y
+            # error radial
+            curx, cury = self.current
+            errx = tx - curx
+            erry = ty - cury
 
-            # derivada (D)
-            derr_x = (err_x - self.last_error[0]) / self.dt
-            derr_y = (err_y - self.last_error[1]) / self.dt
+            corr_x = self.kp * errx
+            corr_y = self.kp * erry
 
-            # PD correction
-            corr_x = self.Kp * err_x + self.Kd * derr_x
-            corr_y = self.Kp * err_y + self.Kd * derr_y
+            cmd_x = vff_x + corr_x
+            cmd_y = vff_y + corr_y
 
-            # comando de velocidad = feedforward + corrección
-            cmd_x = v_ff_x + corr_x
-            cmd_y = v_ff_y + corr_y
-
-            # limitar magnitud
+            # saturación
             mag = math.hypot(cmd_x, cmd_y)
             if mag > self.max_speed:
-                scale = self.max_speed / mag
-                cmd_x *= scale
-                cmd_y *= scale
+                s = self.max_speed / mag
+                cmd_x *= s; cmd_y *= s
 
-            # publicar
-            msg = Twist()
-            msg.linear.x = float(cmd_x)
-            msg.linear.y = float(cmd_y)
-            msg.linear.z = 0.0
-            msg.angular.z = 0.0
-            self.pub.publish(msg)
+            # publicar (Twist y TwistStamped)
+            t = Twist(); t.linear.x=cmd_x; t.linear.y=cmd_y; t.linear.z=0.0; t.angular.z=0.0
+            self.pub_twist.publish(t)
+            ts = TwistStamped(); ts.header.stamp = self.get_clock().now().to_msg(); ts.twist = t
+            self.pub_ts.publish(ts)
 
-            # guardar error para D
-            self.last_error = (err_x, err_y)
-
-            # detectar vuelta completa
-            if self.total_theta >= 2.0 * math.pi * self.loops:
-                self.get_logger().info("✅ Objetivo angular logrado (vueltas completadas). Parando perímetro.")
-                self.finished_circle = True
-                # parar momentáneamente feedforward y dejar que el controlador finalice
-                self.theta = 0.0
+            if self.total_theta >= 2.0*math.pi*self.loops:
+                self.get_logger().info("Vueltas completadas — iniciando retorno.")
+                self.returning = True
                 self.total_theta = 0.0
-                # publicar unos zeros cortos para marcar transición
-                self.publish_zero_times(int(self.rate * 0.05))
+                self.publish_zeroes(int(self.rate * 0.05))
         else:
-            # Fase de regresar al centro: controlador proporcional simple (con saturación)
-            cur_x, cur_y, cur_z = self.pose
-            cx, cy, cz = self.center
-            err_x = cx - cur_x
-            err_y = cy - cur_y
-            dist_to_center = math.hypot(err_x, err_y)
-
-            if dist_to_center <= self.center_tolerance:
-                self.get_logger().info(f"🏁 Centro alcanzado (dist={dist_to_center:.3f} m). Publicando zeros y cerrando.")
-                self.publish_zero_times(int(self.rate * 0.2))
-                # shutdown ROS de forma ordenada
-                self.destroy_node()
-                rclpy.shutdown()
+            # regresar al centro
+            cx, cy = self.center
+            curx, cury = self.current
+            errx = cx - curx; erry = cy - cury
+            dist = math.hypot(errx, erry)
+            if dist <= self.center_tol:
+                self.get_logger().info(f"Centro alcanzado (dist={dist:.3f}). Publicando zeros.")
+                self.publish_zeroes(int(self.rate * 0.2))
                 return
-
-            # controlador simple P para volver al centro
-            cmd_x = self.Kp * err_x
-            cmd_y = self.Kp * err_y
+            cmd_x = self.kp * errx; cmd_y = self.kp * erry
             mag = math.hypot(cmd_x, cmd_y)
             if mag > self.max_speed:
-                scale = self.max_speed / mag
-                cmd_x *= scale
-                cmd_y *= scale
+                s = self.max_speed / mag
+                cmd_x *= s; cmd_y *= s
+            t = Twist(); t.linear.x=cmd_x; t.linear.y=cmd_y; t.linear.z=0.0; t.angular.z=0.0
+            self.pub_twist.publish(t)
+            ts = TwistStamped(); ts.header.stamp = self.get_clock().now().to_msg(); ts.twist = t
+            self.pub_ts.publish(ts)
 
-            msg = Twist()
-            msg.linear.x = float(cmd_x)
-            msg.linear.y = float(cmd_y)
-            msg.linear.z = 0.0
-            msg.angular.z = 0.0
-            self.pub.publish(msg)
-
-    def publish_zero_times(self, n):
+    def publish_zeroes(self, n):
         zero = Twist()
         for _ in range(n):
-            self.pub.publish(zero)
+            self.pub_twist.publish(zero)
+            ts = TwistStamped(); ts.header.stamp = self.get_clock().now().to_msg(); ts.twist = zero
+            self.pub_ts.publish(ts)
             time.sleep(self.dt)
 
-def main(args=None):
-    rclpy.init(args=args)
-    node = MavrosCircleClosedLoop()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        node.get_logger().warn("Interrupción por teclado — deteniendo y publicando zeros.")
-        node.publish_zero_times(10)
-    finally:
-        try:
-            node.destroy_node()
-        except Exception:
-            pass
-        rclpy.shutdown()
+    # --- utilidades (idénticas a tu visualizer) ---
+    def compute_theta(self):
+        mode = self.calib_mode
+        if mode == 'enu':
+            return 0.0
+        elif mode == 'angle':
+            return math.radians(self.calib_ang)
+        else:  # pair
+            dx, dy, dz = self.Xr - self.X0, self.Yr - self.Y0, self.Zr - self.Z0
+            ref = self.R_enu.dot([dx, dy, dz])
+            east, north = float(ref[0]), float(ref[1])
+            theta_measured = math.atan2(north, east)
+            theta_expected = math.atan2(self.expected_local_y, self.expected_local_x)
+            return theta_expected - theta_measured
 
-if __name__ == '__main__':
+    @staticmethod
+    def geodetic_to_ecef(lat_r, lon_r, alt):
+        N = WGS84_A / math.sqrt(1 - WGS84_E2 * math.sin(lat_r)**2)
+        x = (N + alt) * math.cos(lat_r) * math.cos(lon_r)
+        y = (N + alt) * math.cos(lat_r) * math.sin(lon_r)
+        z = (N * (1 - WGS84_E2) + alt) * math.sin(lat_r)
+        return x, y, z
+
+    @staticmethod
+    def get_rotation_matrix(lat_r, lon_r):
+        return np.array([
+            [-math.sin(lon_r),                 math.cos(lon_r),                 0],
+            [-math.sin(lat_r)*math.cos(lon_r), -math.sin(lat_r)*math.sin(lon_r), math.cos(lat_r)],
+            [ math.cos(lat_r)*math.cos(lon_r),  math.cos(lat_r)*math.sin(lon_r), math.sin(lat_r)]
+        ])
+
+def main():
+    rclpy.init()
+    node = CircleRTKAccurate()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__=='__main__':
     main()
