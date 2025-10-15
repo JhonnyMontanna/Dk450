@@ -1,151 +1,139 @@
 #!/usr/bin/env python3
-import argparse
-from pymavlink import mavutil
-import time
 import math
 import numpy as np
+import argparse
 import matplotlib.pyplot as plt
-from collections import deque
+from pymavlink import mavutil
+import time
 
-# ---------------- Argumentos ----------------
-parser = argparse.ArgumentParser(description="Monitoreo de posición XYZ en tiempo real tipo visualizer")
-parser.add_argument('--conn', default='udp:127.0.0.1:14552', help="Conexión al dron (default: udp:127.0.0.1:14552)")
-parser.add_argument('--mode', choices=['local','global'], default='global', help="Modo de coordenadas")
-parser.add_argument('--origin-lat', type=float, default=19.5942341)
-parser.add_argument('--origin-lon', type=float, default=-99.2280871)
-parser.add_argument('--origin-alt', type=float, default=2329.0)
-parser.add_argument('--calib-mode', choices=['enu','angle','pair'], default='pair')
-parser.add_argument('--calib-lat', type=float, default=19.5942429)
-parser.add_argument('--calib-lon', type=float, default=-99.2280774)
-parser.add_argument('--calib-alt', type=float, default=2329.0)
-parser.add_argument('--calib-ang', type=float, default=180.0)
-parser.add_argument('--expected-local-x', type=float, default=1.0)
-parser.add_argument('--expected-local-y', type=float, default=1.0)
-parser.add_argument('--out', choices=['ned','enu'], default='enu')
-parser.add_argument('--alt-mode', choices=['ned','computed','lidar'], default='ned', help="Altura a mostrar")
-parser.add_argument('--visible', type=int, default=120)
-parser.add_argument('--csv', default=None, help="Archivo CSV opcional")
-args = parser.parse_args()
-
-# ---------------- Constantes WGS84 ----------------
+# Constants WGS84
 WGS84_A  = 6378137.0
 WGS84_E2 = 6.69437999014e-3
 
-# ---------------- Conexión MAVLink ----------------
-print(f"Conectando a {args.conn} ...")
-master = mavutil.mavlink_connection(args.conn)
-master.wait_heartbeat()
-print(f"Conectado al sistema {master.target_system} comp {master.target_component}")
-
-# ---------------- Variables para lidar (si no hay sensor, queda en 0) ----------------
-lidar_z = 0.0
-
-# ---------------- Funciones de transformación ----------------
 def geodetic_to_ecef(lat_r, lon_r, alt):
     N = WGS84_A / math.sqrt(1 - WGS84_E2 * math.sin(lat_r)**2)
     x = (N + alt) * math.cos(lat_r) * math.cos(lon_r)
     y = (N + alt) * math.cos(lat_r) * math.sin(lon_r)
     z = (N * (1 - WGS84_E2) + alt) * math.sin(lat_r)
-    return np.array([x, y, z])
+    return x, y, z
 
-def rotation_matrix(lat0, lon0):
+def get_rotation_matrix(lat_r, lon_r):
     return np.array([
-        [-math.sin(lon0),                 math.cos(lon0),                 0],
-        [-math.sin(lat0)*math.cos(lon0), -math.sin(lat0)*math.sin(lon0), math.cos(lat0)],
-        [ math.cos(lat0)*math.cos(lon0),  math.cos(lat0)*math.sin(lon0), math.sin(lat0)]
+        [-math.sin(lon_r),                 math.cos(lon_r),                 0],
+        [-math.sin(lat_r)*math.cos(lon_r), -math.sin(lat_r)*math.sin(lon_r), math.cos(lat_r)],
+        [ math.cos(lat_r)*math.cos(lon_r),  math.cos(lat_r)*math.sin(lon_r), math.sin(lat_r)]
     ])
 
-def compute_theta(origin_ecef, calib_ecef, R_enu, args):
-    dx, dy, dz = calib_ecef - origin_ecef
-    ref = R_enu.dot([dx, dy, dz])
+def compute_theta(X0, Y0, Z0, Xr, Yr, Zr, expected_local_x, expected_local_y):
+    dx, dy, dz = Xr - X0, Yr - Y0, Zr - Z0
+    ref = np.array([dx, dy, dz])
     east, north = float(ref[0]), float(ref[1])
-    if args.calib_mode == 'angle':
-        return math.radians(args.calib_ang)
-    elif args.calib_mode == 'enu':
-        return 0.0
-    else:  # pair
-        theta_measured = math.atan2(north, east)
-        theta_expected = math.atan2(args.expected_local_y, args.expected_local_x)
-        return theta_expected - theta_measured
+    theta_measured = math.atan2(north, east)
+    theta_expected = math.atan2(expected_local_y, expected_local_x)
+    return theta_expected - theta_measured
 
-# ---------------- Pre-cálculos ----------------
-lat0 = math.radians(args.origin_lat)
-lon0 = math.radians(args.origin_lon)
-lat_ref = math.radians(args.calib_lat)
-lon_ref = math.radians(args.calib_lon)
-h0 = args.origin_alt
-h_ref = args.calib_alt
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--conn", default="udp:127.0.0.1:14552")
+    parser.add_argument("--mode", choices=['global','local'], required=True)
+    parser.add_argument("--origin-lat", type=float, required=True)
+    parser.add_argument("--origin-lon", type=float, required=True)
+    parser.add_argument("--origin-alt", type=float, required=True)
+    parser.add_argument("--calib-lat", type=float, required=True)
+    parser.add_argument("--calib-lon", type=float, required=True)
+    parser.add_argument("--calib-alt", type=float, required=True)
+    parser.add_argument("--calib-mode", choices=['enu','angle','pair'], default='pair')
+    parser.add_argument("--calib-ang", type=float, default=0.0)
+    parser.add_argument("--expected-local-x", type=float, default=1.0)
+    parser.add_argument("--expected-local-y", type=float, default=1.0)
+    parser.add_argument("--out", choices=['ned','enu'], default='enu')
+    parser.add_argument("--alt-mode", choices=['ned','computed','lidar'], default='computed')
+    parser.add_argument("--visible", type=int, default=120)
+    parser.add_argument("--csv", type=str, default=None)
+    args = parser.parse_args()
 
-X0 = geodetic_to_ecef(lat0, lon0, h0)
-Xr = geodetic_to_ecef(lat_ref, lon_ref, h_ref)
-R_enu = rotation_matrix(lat0, lon0)
-theta = compute_theta(X0, Xr, R_enu, args)
+    # Convert origin/calib to radians
+    lat0, lon0 = math.radians(args.origin_lat), math.radians(args.origin_lon)
+    latr, lonr = math.radians(args.calib_lat), math.radians(args.calib_lon)
+    h0, href = args.origin_alt, args.calib_alt
 
-# ---------------- Preparar gráficas ----------------
-max_points = args.visible
-x_hist, y_hist, z_hist = deque(maxlen=max_points), deque(maxlen=max_points), deque(maxlen=max_points)
+    # ECEF origin & calibration
+    X0, Y0, Z0 = geodetic_to_ecef(lat0, lon0, h0)
+    Xr, Yr, Zr = geodetic_to_ecef(latr, lonr, href)
 
-plt.ion()
-fig, axs = plt.subplots(3,1, figsize=(8,6))
-lines = []
-for ax, label in zip(axs, ['X','Y','Z']):
-    line, = ax.plot([], [], label=label)
-    ax.set_ylabel(f"{label} (m)")
-    ax.grid(True)
-    ax.legend()
-    lines.append(line)
-axs[-1].set_xlabel("Tiempo")
+    # Rotation ENU
+    R_enu = get_rotation_matrix(lat0, lon0)
 
-def update_plot():
-    lines[0].set_data(range(len(x_hist)), x_hist)
-    lines[1].set_data(range(len(y_hist)), y_hist)
-    lines[2].set_data(range(len(z_hist)), z_hist)
-    for ax in axs:
-        ax.relim()
-        ax.autoscale_view()
-    plt.pause(0.001)
+    # Compute theta correction
+    theta = compute_theta(X0, Y0, Z0, Xr, Yr, Zr, args.expected_local_x, args.expected_local_y)
 
-# ---------------- Loop principal ----------------
-print("Iniciando monitoreo XYZ (Ctrl+C para detener)...")
-try:
+    # Connect to drone
+    print(f"Connecting to {args.conn}...")
+    master = mavutil.mavlink_connection(args.conn)
+    master.wait_heartbeat()
+    print("Heartbeat received")
+
+    # Plot setup
+    plt.ion()
+    fig, ax = plt.subplots(3,1,sharex=True,figsize=(8,6))
+    lines = [ax[i].plot([],[],'-')[0] for i in range(3)]
+    ax[0].set_ylabel('X [m]'); ax[1].set_ylabel('Y [m]'); ax[2].set_ylabel('Z [m]')
+    ax[2].set_xlabel('Time [s]')
+    Xdata, Ydata, Zdata, Tdata = [], [], [], []
+
+    start_time = time.time()
+    lidar_z = 0.0
+
     while True:
-        msg = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
-        if not msg:
+        msg = master.recv_match(type=['GLOBAL_POSITION_INT','VFR_HUD','DISTANCE_SENSOR'], blocking=True)
+        if msg is None:
             continue
 
-        lat = msg.lat / 1e7
-        lon = msg.lon / 1e7
-        alt = msg.relative_alt / 1000.0  # metros
+        # Altura LIDAR
+        if msg.get_type() == 'DISTANCE_SENSOR':
+            lidar_z = msg.current_distance / 100.0  # mm→m
 
-        # ---------------- Transformación a ENU ----------------
-        Xe, Ye, Ze = geodetic_to_ecef(math.radians(lat), math.radians(lon), alt)
-        d = Xe - X0, Ye - X0, Ze - X0
-        d = np.array([Xe - X0[0], Ye - X0[1], Ze - X0[2]])
-        enu = R_enu.dot(d)
-        # Rotación por theta
-        xr = enu[0]*math.cos(theta) - enu[1]*math.sin(theta)
-        yr = enu[0]*math.sin(theta) + enu[1]*math.cos(theta)
-        zr_ned = enu[2]
+        # Coordenadas GPS
+        if msg.get_type() == 'GLOBAL_POSITION_INT':
+            lat = msg.lat / 1e7
+            lon = msg.lon / 1e7
+            alt = msg.alt / 1000.0  # mm→m
 
-        # ---------------- Selección de altura ----------------
-        if args.alt_mode == 'ned':
-            z_plot = zr_ned
-        elif args.alt_mode == 'computed':
-            z_plot = alt - h0
-        else:
-            z_plot = lidar_z
+            lat_r, lon_r = math.radians(lat), math.radians(lon)
+            Xe, Ye, Ze = geodetic_to_ecef(lat_r, lon_r, alt)
+            d = np.array([Xe - X0, Ye - Y0, Ze - Z0])
+            enu = R_enu.dot(d)
 
-        x_hist.append(xr)
-        y_hist.append(yr)
-        z_hist.append(z_plot)
+            # Rotate theta
+            xr = enu[0]*math.cos(theta) - enu[1]*math.sin(theta)
+            yr = enu[0]*math.sin(theta) + enu[1]*math.cos(theta)
 
-        print(f"X={xr:.2f}, Y={yr:.2f}, Z={z_plot:.2f}")
+            # Select altitude
+            if args.alt_mode == 'ned':
+                zr = -enu[2]  # Down positive
+            elif args.alt_mode == 'computed':
+                zr = alt - h0
+            else:
+                zr = lidar_z
 
-        if args.csv:
-            with open(args.csv,'a') as f:
-                f.write(f"{time.time()},{xr},{yr},{z_plot}\n")
+            t = time.time() - start_time
+            Xdata.append(xr); Ydata.append(yr); Zdata.append(zr); Tdata.append(t)
 
-        update_plot()
+            # Update plots
+            for l, d in zip(lines, [Xdata,Ydata,Zdata]):
+                l.set_data(Tdata, d)
+            for a in ax:
+                a.relim()
+                a.autoscale_view()
+            plt.pause(0.001)
 
-except KeyboardInterrupt:
-    print("Monitoreo detenido.")
+            # Print
+            print(f"t={t:.1f}s | X={xr:.2f} Y={yr:.2f} Z={zr:.2f}")
+
+            # Optional CSV
+            if args.csv:
+                with open(args.csv,'a') as f:
+                    f.write(f"{t},{xr},{yr},{zr}\n")
+
+if __name__=="__main__":
+    main()
