@@ -40,7 +40,7 @@ print(f"Conectado al sistema {master.target_system} comp {master.target_componen
 # ---------------- Variables para lidar (si no hay sensor, queda en 0) ----------------
 lidar_z = 0.0
 
-# ---------------- Funciones de transformación ----------------
+# ---------------- Funciones ----------------
 def geodetic_to_ecef(lat_r, lon_r, alt):
     N = WGS84_A / math.sqrt(1 - WGS84_E2 * math.sin(lat_r)**2)
     x = (N + alt) * math.cos(lat_r) * math.cos(lon_r)
@@ -115,21 +115,23 @@ try:
 
         lat = msg.lat / 1e7
         lon = msg.lon / 1e7
-        alt = msg.relative_alt / 1000.0  # metros
+        rel_alt = msg.relative_alt / 1000.0  # metros
+        alt = msg.alt / 1000.0 if hasattr(msg, 'alt') else 0.0  # Si tienes alt absoluto del GNSS
 
         # ---------------- Transformación a ENU ----------------
         Xe, Ye, Ze = geodetic_to_ecef(math.radians(lat), math.radians(lon), alt)
-        d = np.array([Xe - X0[0], Ye - X0[1], Ze - X0[2]])  # <-- CORRECCIÓN
+        d = np.array([Xe - X0[0], Ye - X0[1], Ze - X0[2]])
         enu = R_enu.dot(d)
+
+        # Rotación por theta
         xr = enu[0]*math.cos(theta) - enu[1]*math.sin(theta)
         yr = enu[0]*math.sin(theta) + enu[1]*math.cos(theta)
-        zr_ned = -enu[2]  # NED = Down positivo
 
         # ---------------- Selección de altura ----------------
         if args.alt_mode == 'ned':
-            z_plot = zr_ned
+            z_plot = rel_alt  # Altitud relativa NED de MAVLink
         elif args.alt_mode == 'computed':
-            z_plot = alt - h0
+            z_plot = alt - h0  # Altitud relativa al origen RTK
         else:
             z_plot = lidar_z
 
