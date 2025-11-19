@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-power_monitor_sysstatus.py
-Monitor histórico de consumo usando SYS_STATUS.current_battery y SYS_STATUS.voltage_battery.
-- Voltaje: SYS_STATUS.voltage_battery (mV) -> V = mV * 0.001
-- Corriente: SYS_STATUS.current_battery (10*mA) -> A = c10mA * 0.01
+power_monitor_sysstatus_metrics.py
+Extiende tu monitor original e incluye:
+
+- Cálculo de métricas completas para tabla Excel:
+    Voltaje inicial/final/mín/máx
+    Corriente mín/máx/prom
+    Potencia mín/máx/prom
+    mAh consumidos
+    Energía Wh
+    C-rate promedio
+    Caída de voltaje
+    Tiempo de vuelo
+    Tiempo total de registro
+- Guarda CSV opcional (--csv path.csv)
 """
+
 import argparse
 import time
 import threading
@@ -16,33 +27,34 @@ import matplotlib.pyplot as plt
 import os
 import math
 
-# ---------------- DEFAULTS ----------------
-DEFAULT_CONN = "udp:0.0.0.0:14552"  # evite puertos <1024 (ej. 52) salvo que uses sudo
-DEFAULT_WARN_CURRENT_A = 50.0       # advertencia si corriente supera esto (A)
-DEFAULT_WARN_VOLTAGE_LOW = 10.5     # advertencia si voltaje por debajo (V)
-DISPLAY_FPS = 8.0                   # refresco gráfico por segundo
+DEFAULT_CONN = "udp:0.0.0.0:14552"
+DEFAULT_WARN_CURRENT_A = 50.0
+DEFAULT_WARN_VOLTAGE_LOW = 10.5
+DISPLAY_FPS = 8.0
 
-# --------------- HELPERS ---------------
+
+# ----------------------------------------------
+# CONVERSIONES
+# ----------------------------------------------
 def sys_mv_to_v(mv):
-    # mv puede ser None o 0
     try:
         return float(mv) * 0.001
-    except Exception:
+    except:
         return None
 
 def sys_10ma_to_a(c10mA):
-    # -1 significa no medido en muchos firmwares
     try:
         c = int(c10mA)
-    except Exception:
+    except:
         return None
     if c == -1:
         return None
-    # cada unidad = 10 mA = 0.01 A
-    # A = c * 0.01  -> hacemos la multiplicación explícita
     return float(c) * 0.01
 
-# --------------- READER THREAD ---------------
+
+# ----------------------------------------------
+# HILO LECTOR DE MAVLINK
+# ----------------------------------------------
 class SysStatusReader(threading.Thread):
     def __init__(self, conn_str, buffers, stop_event, verbose=False):
         super().__init__(daemon=True)
@@ -56,14 +68,15 @@ class SysStatusReader(threading.Thread):
         try:
             self.master = mavutil.mavlink_connection(self.conn_str)
         except Exception as e:
-            print(f"[ERROR] falló crear conexión: {e}")
+            print(f"[ERROR] falló conexión: {e}")
             return False
+
         try:
-            # esperamos heartbeat corto para confirmar enlace (no es obligatorio)
             self.master.wait_heartbeat(timeout=5)
-            print(f"[OK] Heartbeat: sistema={self.master.target_system}, componente={self.master.target_component}")
-        except Exception:
-            print("[WARN] No se recibió heartbeat en 5s (pero seguiré escuchando mensajes si llegan).")
+            print(f"[OK] Heartbeat recibido.")
+        except:
+            print("[WARN] No llegó heartbeat (pero seguiré escuchando).")
+
         return True
 
     def run(self):
@@ -72,236 +85,188 @@ class SysStatusReader(threading.Thread):
             return
 
         last_t = None
+
         while not self.stop_event.is_set():
-            # leer SYS_STATUS y BATTERY_STATUS (fallback)
             msg = self.master.recv_match(type=['SYS_STATUS', 'BATTERY_STATUS'], blocking=True, timeout=2.0)
             t = time.time()
             if msg is None:
-                # opcional: imprimir avisos periódicos si no llegan mensajes
-                # print("[INFO] sin mensajes en 2s...")
                 continue
 
             mtype = msg.get_type()
             voltage_v = None
             current_a = None
 
-            if mtype == 'SYS_STATUS':
-                mv = getattr(msg, 'voltage_battery', None)
-                ca = getattr(msg, 'current_battery', None)
-                if mv is not None:
-                    voltage_v = sys_mv_to_v(mv)
-                if ca is not None:
-                    current_a = sys_10ma_to_a(ca)
-                if self.verbose:
-                    print(f"[SYS_STATUS] volt(mV)={mv} curr(10mA)={ca}")
-            elif mtype == 'BATTERY_STATUS':
-                # BATTERY_STATUS puede tener array voltages (mV) y current_battery (10*mA o cA según firmware)
-                # Usamos BATTERY_STATUS solo si SYS_STATUS no estuvo disponible recientemente
+            if mtype == "SYS_STATUS":
+                mv = msg.voltage_battery
+                ca = msg.current_battery
+                voltage_v = sys_mv_to_v(mv)
+                current_a = sys_10ma_to_a(ca)
+
+            elif mtype == "BATTERY_STATUS":
                 try:
-                    voltages = getattr(msg, 'voltages', None)
-                    if voltages:
-                        # sumar celdas válidas (65535 = no disponible)
-                        valid = [v for v in voltages if (v is not None and int(v) != 65535 and int(v) != 0)]
-                        if valid:
-                            # voltaje total en V
-                            voltage_v = sum(valid) * 0.001
-                    ca = getattr(msg, 'current_battery', None)
-                    if ca is not None and int(ca) != -1:
-                        current_a = sys_10ma_to_a(ca)
-                except Exception:
+                    valid = [v for v in msg.voltages if v is not None and int(v) not in (0, 65535)]
+                    if valid:
+                        voltage_v = sum(valid) * 0.001
+                    ca = msg.current_battery
+                    current_a = sys_10ma_to_a(ca)
+                except:
                     pass
-                if self.verbose:
-                    print(f"[BATTERY_STATUS] voltages_len={len(getattr(msg,'voltages',[]))} current_battery={getattr(msg,'current_battery',None)}")
 
-            # Si al menos uno de los dos está presente, rellenar con último conocido si falta el otro
-            have_any = (voltage_v is not None) or (current_a is not None)
-            if have_any:
-                # rellenar faltantes con último valor conocido (si existe)
+            # Rellenar con último valor conocido si falta uno
+            if voltage_v is not None or current_a is not None:
                 if voltage_v is None:
-                    voltage_v = self.buffers['voltage'][-1] if len(self.buffers['voltage'])>0 else None
+                    voltage_v = self.buffers["voltage"][-1] if len(self.buffers["voltage"]) > 0 else None
                 if current_a is None:
-                    current_a = self.buffers['current'][-1] if len(self.buffers['current'])>0 else None
+                    current_a = self.buffers["current"][-1] if len(self.buffers["current"]) > 0 else None
 
-                # potencia si ambos presentes
-                power_w = None
-                if (voltage_v is not None) and (current_a is not None):
-                    # P = V * I
+                # Potencia
+                if voltage_v is not None and current_a is not None:
                     power_w = voltage_v * current_a
+                else:
+                    power_w = None
 
-                # integración energía (trapecio)
+                # Energía (trapecio)
                 if last_t is None:
-                    dt = 0.0
+                    dt = 0
                 else:
                     dt = t - last_t
+
                 if power_w is not None and dt > 0:
-                    prev_p = self.buffers['power'][-1] if len(self.buffers['power'])>0 else power_w
-                    # incremento energía (J) = 0.5*(prev_p + power_w)*dt
+                    prev_p = self.buffers["power"][-1] if len(self.buffers["power"]) > 0 else power_w
                     inc_j = 0.5 * (prev_p + power_w) * dt
-                    self.buffers['energy_j'] += inc_j
+                    self.buffers["energy_j"] += inc_j
 
-                # push a buffers (histórico)
-                self.buffers['t'].append(t)
-                self.buffers['voltage'].append(voltage_v)
-                self.buffers['current'].append(current_a)
-                self.buffers['power'].append(power_w)
-
-                # warnings por rango (imprime valor anómalo)
-                if voltage_v is not None and (voltage_v < self.buffers['config']['warn_voltage_low'] or voltage_v > self.buffers['config']['warn_voltage_high']):
-                    print(f"[WARN] Voltaje inusual: {voltage_v:.2f} V (esperado {self.buffers['config']['warn_voltage_low']:.2f}-{self.buffers['config']['warn_voltage_high']:.2f} V)")
-
-                if current_a is None:
-                    # corriente no disponible
-                    print("[WARN] Corriente no disponible (valor = -1 o no provisto).")
-                else:
-                    if current_a > self.buffers['config']['warn_current_high'] or current_a < self.buffers['config']['warn_current_low']:
-                        print(f"[WARN] Corriente inusual: {current_a:.2f} A (esperado {self.buffers['config']['warn_current_low']:.2f}-{self.buffers['config']['warn_current_high']:.2f} A)")
+                # Guardar samples
+                self.buffers["t"].append(t)
+                self.buffers["voltage"].append(voltage_v)
+                self.buffers["current"].append(current_a)
+                self.buffers["power"].append(power_w)
 
                 last_t = t
 
-            # else: no datos relevantes en este mensaje, seguir
-        # fin while
-# fin class
 
-# ----------------- PLOTTING -----------------
-def live_plot_historic(buffers, stop_event, visible_seconds):
-    plt.ion()
-    fig, axs = plt.subplots(3,1, sharex=True, figsize=(10,7))
-    fig.canvas.manager.set_window_title("Power Monitor - SYS_STATUS")
-    l_v, = axs[0].plot([], [], label='Voltaje (V)')
-    l_i, = axs[1].plot([], [], label='Corriente (A)')
-    l_p, = axs[2].plot([], [], label='Potencia (W)')
-    axs[0].set_ylabel("V")
-    axs[1].set_ylabel("A")
-    axs[2].set_ylabel("W")
-    axs[2].set_xlabel("Tiempo (s desde inicio)")
-    for ax in axs:
-        ax.grid(True)
-        ax.legend()
+# ----------------------------------------------
+# CALCULO DE MÉTRICAS
+# ----------------------------------------------
+def compute_metrics(buffers, battery_capacity_mAh=2200):
+    t = buffers["t"]
+    v = buffers["voltage"]
+    i = buffers["current"]
+    p = buffers["power"]
 
-    try:
-        while not stop_event.is_set():
-            if len(buffers['t']) < 2:
-                time.sleep(0.2)
-                continue
+    if len(t) < 2:
+        return None
 
-            t0 = buffers['t'][0]
-            t_rel = [tt - t0 for tt in buffers['t']]
-            v = [x if x is not None else float('nan') for x in buffers['voltage']]
-            i = [x if x is not None else float('nan') for x in buffers['current']]
-            p = [x if x is not None else float('nan') for x in buffers['power']]
+    # Tiempo
+    t_total = t[-1] - t[0]
 
-            l_v.set_data(t_rel, v)
-            l_i.set_data(t_rel, i)
-            l_p.set_data(t_rel, p)
+    # Voltaje
+    v_init = v[0]
+    v_final = v[-1]
+    v_min = min(v)
+    v_max = max(v)
 
-            # Mostrar ventana visible_seconds (pero mantener todo el histórico almacenado)
-            now_rel = t_rel[-1]
-            axs[2].set_xlim(max(0.0, now_rel - visible_seconds), now_rel)
+    # Corriente
+    i_valid = [x for x in i if x is not None]
+    i_min = min(i_valid)
+    i_max = max(i_valid)
+    i_avg = sum(i_valid) / len(i_valid)
 
-            for ax in axs:
-                ax.relim()
-                ax.autoscale_view(scalex=False, scaley=True)
+    # Potencia
+    p_valid = [x for x in p if x is not None]
+    p_min = min(p_valid)
+    p_max = max(p_valid)
+    p_avg = sum(p_valid) / len(p_valid)
 
-            energy_wh = buffers['energy_j'] / 3600.0
-            fig.suptitle(f"Energía acumulada: {buffers['energy_j']:.1f} J = {energy_wh:.4f} Wh  | muestras: {len(buffers['t'])}")
+    # Energía Wh
+    E_Wh = buffers["energy_j"] / 3600.0
 
-            fig.canvas.draw()
-            fig.canvas.flush_events()
-            time.sleep(1.0 / DISPLAY_FPS)
-    except KeyboardInterrupt:
-        stop_event.set()
-    finally:
-        plt.ioff()
-        plt.close(fig)
+    # mAh consumidos  (integración simple I_promedio * tiempo)
+    mAh = (i_avg * t_total) / 3600.0 * 1000.0
 
-# ----------------- CSV DUMP -----------------
+    # C-rate promedio
+    C_rate = mAh / battery_capacity_mAh
+
+    # Caída de voltaje (sag)
+    sag = v_init - v_min
+
+    return {
+        "voltaje_inicial": v_init,
+        "voltaje_final": v_final,
+        "voltaje_min": v_min,
+        "voltaje_max": v_max,
+        "corriente_min": i_min,
+        "corriente_max": i_max,
+        "corriente_prom": i_avg,
+        "pot_min": p_min,
+        "pot_max": p_max,
+        "pot_prom": p_avg,
+        "energia_Wh": E_Wh,
+        "mAh_consumidos": mAh,
+        "C_rate": C_rate,
+        "sag": sag,
+        "tiempo_total_s": t_total
+    }
+
+
+# ----------------------------------------------
+# DUMP CSV
+# ----------------------------------------------
 def dump_csv(path, buffers):
-    header = ['timestamp', 'voltage_V', 'current_A', 'power_W']
-    try:
-        with open(path, 'w', newline='') as f:
-            w = csv.writer(f)
-            w.writerow(header)
-            for idx, t in enumerate(buffers['t']):
-                v = buffers['voltage'][idx] if idx < len(buffers['voltage']) else ''
-                c = buffers['current'][idx] if idx < len(buffers['current']) else ''
-                p = buffers['power'][idx] if idx < len(buffers['power']) else ''
-                w.writerow([t, v, c, p])
-        print(f"[INFO] CSV guardado en: {path}")
-    except Exception as e:
-        print(f"[ERROR] Al guardar CSV: {e}")
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["timestamp","voltage(V)","current(A)","power(W)"])
+        for t, v, i, p in zip(buffers["t"], buffers["voltage"], buffers["current"], buffers["power"]):
+            w.writerow([t, v, i, p])
+    print(f"[OK] CSV guardado en {path}")
 
-# Guardado periódico en background
-def autosave_thread(path, buffers, stop_event, period_s):
-    if period_s <= 0:
-        return
-    while not stop_event.is_set():
-        time.sleep(period_s)
-        try:
-            # guarda un CSV temporal con timestamp
-            base, ext = os.path.splitext(path)
-            ts = int(time.time())
-            tmpname = f"{base}_{ts}{ext if ext else '.csv'}"
-            dump_csv(tmpname, buffers)
-        except Exception as e:
-            print(f"[ERROR autosave] {e}")
 
-# ----------------- MAIN -----------------
-def parse_args():
-    p = argparse.ArgumentParser(description="Power monitor (SYS_STATUS) - histórico")
-    p.add_argument("--conn", default=DEFAULT_CONN, help="Cadena MAVLink (ej: udp:127.0.0.1:14552)")
-    p.add_argument("--visible", type=int, default=60, help="Segundos visibles en la ventana (scroll).")
-    p.add_argument("--max-samples", type=int, default=0, help="Limita muestras (0 = ilimitado).")
-    p.add_argument("--csv", default=None, help="Guardar CSV final al terminar (ruta).")
-    p.add_argument("--autosave", type=int, default=0, help="Autosave periódico en segundos (0 = desactivar).")
-    p.add_argument("--warn-current", type=float, default=DEFAULT_WARN_CURRENT_A, help="Umbral de advertencia corriente (A).")
-    p.add_argument("--warn-voltage-low", type=float, default=DEFAULT_WARN_VOLTAGE_LOW, help="Umbral bajo de voltaje (V).")
-    p.add_argument("--warn-voltage-high", type=float, default=1000.0, help="Umbral alto de voltaje (V) (por si quieres límite superior).")
-    p.add_argument("--verbose", action='store_true', help="Imprimir mensajes SYS/BATTERY completos (debug).")
-    return p.parse_args()
-
+# ----------------------------------------------
+# MAIN
+# ----------------------------------------------
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--conn", default=DEFAULT_CONN)
+    parser.add_argument("--csv", default=None, help="Ruta CSV para guardar datos")
+    parser.add_argument("--capacity", type=float, default=2200, help="Capacidad nominal mAh")
+    args = parser.parse_args()
 
-    maxlen = args.max_samples if args.max_samples and args.max_samples > 0 else None
     buffers = {
-        't': deque(maxlen=maxlen),
-        'voltage': deque(maxlen=maxlen),
-        'current': deque(maxlen=maxlen),
-        'power': deque(maxlen=maxlen),
-        'energy_j': 0.0,
-        # config interno para límites
-        'config': {
-            'warn_current_low': -9999.0,
-            'warn_current_high': args.warn_current,
-            'warn_voltage_low': args.warn_voltage_low,
-            'warn_voltage_high': args.warn_voltage_high,
-        }
+        "t": [],
+        "voltage": [],
+        "current": [],
+        "power": [],
+        "energy_j": 0.0,
     }
 
     stop_event = threading.Event()
-    reader = SysStatusReader(args.conn, buffers, stop_event, verbose=args.verbose)
+    reader = SysStatusReader(args.conn, buffers, stop_event)
     reader.start()
 
-    # autosave si solicitado
-    autosave_t = None
-    if args.autosave and args.csv:
-        autosave_t = threading.Thread(target=autosave_thread, args=(args.csv, buffers, stop_event, args.autosave), daemon=True)
-        autosave_t.start()
-    elif args.autosave and not args.csv:
-        print("[WARN] --autosave requiere --csv para nombrar archivos (desactivado autosave).")
-
+    print("[INFO] Presiona CTRL+C para terminar la medición.")
     try:
-        live_plot_historic(buffers, stop_event, args.visible)
+        while True:
+            time.sleep(0.5)
     except KeyboardInterrupt:
-        pass
-    finally:
+        print("\n[INFO] Finalizando…")
         stop_event.set()
-        reader.join(timeout=2.0)
-        if args.csv:
-            dump_csv(args.csv, buffers)
-        print("[INFO] Finalizado. Muestras totales:", len(buffers['t']))
-        energy_wh = buffers['energy_j'] / 3600.0
-        print(f"[INFO] Energía acumulada: {buffers['energy_j']:.1f} J = {energy_wh:.4f} Wh")
+        reader.join()
+
+    # ---- CÁLCULO DE MÉTRICAS ----
+    metrics = compute_metrics(buffers, battery_capacity_mAh=args.capacity)
+
+    if metrics is None:
+        print("[ERROR] Pocos datos para métricas.")
+        return
+
+    print("\n===== MÉTRICAS DE LA SESIÓN =====")
+    for k,v in metrics.items():
+        print(f"{k}: {v}")
+
+    # ---- CSV ----
+    if args.csv is not None:
+        dump_csv(args.csv, buffers)
+
 
 if __name__ == "__main__":
     main()

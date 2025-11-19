@@ -16,7 +16,7 @@ class MavlinkBridge(Node):
         self.sonar_pub = self.create_publisher(Float32, '/sonar_altitude', 10)
         
         # Conexión MAVLink
-        self.master = mavutil.mavlink_connection('udpin:0.0.0.0:14550')
+        self.master = mavutil.mavlink_connection('udpin:0.0.0.0:14552')
         #self.master = mavutil.mavlink_connection('/dev/ttyUSB0', baud=57600)
         self.master.wait_heartbeat()
         self.get_logger().info("Conexión MAVLink establecida")
