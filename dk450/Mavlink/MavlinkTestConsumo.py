@@ -2,9 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 power_monitor_sysstatus.py
-Monitor histórico de consumo usando SYS_STATUS.current_battery y SYS_STATUS.voltage_battery.
-- Voltaje: SYS_STATUS.voltage_battery (mV) -> V = mV * 0.001
-- Corriente: SYS_STATUS.current_battery (10*mA) -> A = c10mA * 0.01
+Monitor histórico de consumo con detección automática de vuelo
 """
 import argparse
 import time
@@ -30,11 +28,6 @@ BATTERY_NOMINAL_VOLTAGE = 3.7 * 3    # Nominal voltage for 3S
 BATTERY_FULL_VOLTAGE = 4.2 * 3       # Full charge voltage for 3S
 BATTERY_EMPTY_VOLTAGE = 3.3 * 3      # Empty voltage for 3S
 
-# Voltage sag detection parameters
-VOLTAGE_SAG_THRESHOLD = 0.3          # Voltage drop to detect sag (V)
-LANDING_CURRENT_THRESHOLD = 2.0       # Current threshold for landing detection (A)
-VOLTAGE_STABLE_THRESHOLD = 0.1        # Voltage stability threshold for landing (V)
-
 # --------------- HELPERS ---------------
 def sys_mv_to_v(mv):
     try:
@@ -51,6 +44,21 @@ def sys_10ma_to_a(c10mA):
         return None
     return float(c) * 0.01
 
+def format_min_sec(total_minutes):
+    """Convierte minutos decimal a formato min:seg"""
+    if total_minutes <= 0:
+        return "0:00"
+    
+    minutes = int(total_minutes)
+    seconds = int((total_minutes - minutes) * 60)
+    
+    # Asegurar que los segundos estén en el rango 0-59
+    if seconds >= 60:
+        minutes += 1
+        seconds = 0
+    
+    return f"{minutes}:{seconds:02d}"
+
 # --------------- FLIGHT ANALYSIS ---------------
 class FlightAnalyzer:
     def __init__(self):
@@ -62,26 +70,37 @@ class FlightAnalyzer:
         self.max_power = 0
         self.total_energy_wh = 0
         self.total_charge_mah = 0
+        
+        # Flight detection
         self.flight_start_time = None
         self.flight_end_time = None
         self.in_flight = False
         self.landing_detected = False
-        self.voltage_before_sag = None
-        self.sag_detected = False
-        self.last_voltage = None
-        self.stable_voltage_start = None
+        
+        # Voltage sag detection
+        self.voltage_reposo = None
+        self.voltage_sag_value = 0.0
+        self.reposo_samples = deque(maxlen=20)  # ~2-3 segundos de muestras
+        self.reposo_calculado = False
+        self.sag_detectado = False
+        
+        # Landing detection
+        self.landing_candidate_time = None
+        self.landing_candidate_voltage = None
+        self.stable_voltage_period = 0
         
         # For averages
         self.current_sum = 0
         self.power_sum = 0
         self.sample_count = 0
+        self.flight_current_sum = 0
+        self.flight_power_sum = 0
+        self.flight_sample_count = 0
         
     def update(self, timestamp, voltage, current, power):
         # Initialize first voltage
         if self.initial_voltage is None and voltage is not None:
             self.initial_voltage = voltage
-            self.last_voltage = voltage
-            self.voltage_before_sag = voltage
         
         if voltage is not None:
             # Update min/max voltage
@@ -89,80 +108,125 @@ class FlightAnalyzer:
             self.max_voltage = max(self.max_voltage, voltage)
             self.final_voltage = voltage
             
-            # Detect voltage sag (start of flight)
-            if (not self.in_flight and not self.sag_detected and 
-                self.voltage_before_sag is not None and 
-                self.voltage_before_sag - voltage >= VOLTAGE_SAG_THRESHOLD):
-                self.sag_detected = True
-                self.in_flight = True
-                self.flight_start_time = timestamp
-                print(f"[FLIGHT] Voltage sag detected! Flight started at {timestamp:.1f}s")
+            # 1. CALCULAR VOLTAJE DE REPOSO (primeros 2-3 segundos)
+            if not self.reposo_calculado:
+                self.reposo_samples.append(voltage)
+                if len(self.reposo_samples) >= 15:  # ~1.5-2 segundos de datos
+                    self.voltage_reposo = sum(self.reposo_samples) / len(self.reposo_samples)
+                    self.reposo_calculado = True
+                    print(f"[FLIGHT] Voltaje de reposo calculado: {self.voltage_reposo:.2f}V")
             
-            # Detect landing (low current + stable voltage)
-            if (self.in_flight and not self.landing_detected and 
-                current is not None and current <= LANDING_CURRENT_THRESHOLD):
-                if self.stable_voltage_start is None:
-                    self.stable_voltage_start = timestamp
-                    self.last_voltage = voltage
-                elif timestamp - self.stable_voltage_start >= 5.0:  # Stable for 5 seconds
-                    if abs(voltage - self.last_voltage) <= VOLTAGE_STABLE_THRESHOLD:
-                        self.landing_detected = True
-                        self.in_flight = False
-                        self.flight_end_time = timestamp
-                        print(f"[FLIGHT] Landing detected! Flight ended at {timestamp:.1f}s")
+            # 2. DETECTAR INICIO DE VUELO (primera caída brusca + corriente alta)
+            if (not self.in_flight and not self.sag_detectado and 
+                self.voltage_reposo is not None and current is not None):
+                
+                # Detectar caída brusca: voltaje baja >0.15V respecto al reposo
+                caida_voltage = self.voltage_reposo - voltage
+                if caida_voltage > 0.15 and current > 3.0:
+                    self.sag_detectado = True
+                    self.in_flight = True
+                    self.flight_start_time = timestamp
+                    self.voltage_sag_value = caida_voltage
+                    print(f"[FLIGHT] ¡Inicio de vuelo detectado!")
+                    print(f"[FLIGHT] Sag: {caida_voltage:.2f}V (de {self.voltage_reposo:.2f}V a {voltage:.2f}V)")
+                    print(f"[FLIGHT] Corriente: {current:.1f}A")
+            
+            # 3. DETECTAR FIN DE VUELO (corriente mínima + voltaje estable)
+            if self.in_flight and not self.landing_detected and current is not None:
+                # Condición: corriente muy baja (<2A) indica posible aterrizaje
+                if current < 2.0:
+                    if self.landing_candidate_time is None:
+                        # Primer momento candidato a aterrizaje
+                        self.landing_candidate_time = timestamp
+                        self.landing_candidate_voltage = voltage
+                        self.stable_voltage_period = 0
+                    else:
+                        # Verificar estabilidad del voltaje (±0.05V)
+                        if abs(voltage - self.landing_candidate_voltage) < 0.05:
+                            self.stable_voltage_period += 1
+                        else:
+                            # Voltaje no estable, reiniciar contador
+                            self.landing_candidate_voltage = voltage
+                            self.stable_voltage_period = 0
+                        
+                        # Si tenemos 1 segundo de estabilidad, confirmar aterrizaje
+                        if self.stable_voltage_period >= 5:  # 5 muestras ≈ 1 segundo
+                            self.landing_detected = True
+                            self.in_flight = False
+                            self.flight_end_time = timestamp
+                            print(f"[FLIGHT] ¡Aterrizaje detectado!")
+                            print(f"[FLIGHT] Corriente final: {current:.1f}A, Voltaje estable: {voltage:.2f}V")
                 else:
-                    # Check if voltage is still stable
-                    if abs(voltage - self.last_voltage) > VOLTAGE_STABLE_THRESHOLD:
-                        self.stable_voltage_start = timestamp
-                    self.last_voltage = voltage
-            else:
-                self.stable_voltage_start = None
+                    # Corriente alta, no es aterrizaje
+                    self.landing_candidate_time = None
+                    self.stable_voltage_period = 0
         
+        # Update statistics
         if current is not None:
             self.max_current = max(self.max_current, current)
             self.current_sum += current
             self.sample_count += 1
+            if self.in_flight:
+                self.flight_current_sum += current
+                self.flight_sample_count += 1
             
         if power is not None:
             self.max_power = max(self.max_power, power)
             self.power_sum += power
+            if self.in_flight:
+                self.flight_power_sum += power
     
     def calculate_metrics(self, total_time, total_energy_j):
         metrics = {}
         
-        # Time calculations
-        metrics['Tiempo total (min)'] = total_time / 60.0 if total_time else 0
+        # Time calculations - guardamos en minutos para cálculos pero formateamos para display
+        total_time_min = total_time / 60.0 if total_time else 0
+        metrics['Tiempo total (min)'] = total_time_min
+        metrics['Tiempo total (formateado)'] = format_min_sec(total_time_min)
         
+        # Flight time calculation
+        flight_duration_min = 0
         if self.flight_start_time and self.flight_end_time:
             flight_duration = self.flight_end_time - self.flight_start_time
-            metrics['Tiempo de Vuelo (min)'] = flight_duration / 60.0
+            flight_duration_min = flight_duration / 60.0
+            metrics['Tiempo de Vuelo (min)'] = flight_duration_min
+            metrics['Tiempo de Vuelo (formateado)'] = format_min_sec(flight_duration_min)
+        elif self.flight_start_time and not self.landing_detected:
+            # Vuelo en progreso
+            flight_duration = time.time() - self.flight_start_time
+            flight_duration_min = flight_duration / 60.0
+            metrics['Tiempo de Vuelo (min)'] = flight_duration_min
+            metrics['Tiempo de Vuelo (formateado)'] = format_min_sec(flight_duration_min)
         else:
             metrics['Tiempo de Vuelo (min)'] = 0
+            metrics['Tiempo de Vuelo (formateado)'] = "0:00"
         
         # Voltage metrics
         metrics['Voltaje Inicial (V)'] = self.initial_voltage if self.initial_voltage else 0
         metrics['Voltaje Final (V)'] = self.final_voltage if self.final_voltage else 0
-        
-        if self.voltage_before_sag and self.min_voltage != float('inf'):
-            metrics['Caída de Voltaje(sag) (V)'] = self.voltage_before_sag - self.min_voltage
-        else:
-            metrics['Caída de Voltaje(sag) (V)'] = 0
-            
+        metrics['Caída de Voltaje(sag) (V)'] = self.voltage_sag_value
         metrics['Voltaje Mínimo (V)'] = self.min_voltage if self.min_voltage != float('inf') else 0
         metrics['Voltaje Máximo (V)'] = self.max_voltage
         
         # Current and power metrics
         metrics['I Máxima (A)'] = self.max_current
-        metrics['I Promedio (A)'] = self.current_sum / self.sample_count if self.sample_count > 0 else 0
+        
+        # Calcular promedios solo durante el vuelo
+        if self.flight_sample_count > 0:
+            metrics['I Promedio (A)'] = self.flight_current_sum / self.flight_sample_count
+            metrics['Potencia Promedio (W)'] = self.flight_power_sum / self.flight_sample_count
+        else:
+            metrics['I Promedio (A)'] = 0
+            metrics['Potencia Promedio (W)'] = 0
+            
         metrics['Potencia Máxima (W)'] = self.max_power
-        metrics['Potencia Promedio (W)'] = self.power_sum / self.sample_count if self.sample_count > 0 else 0
         
         # Energy calculations
         metrics['Energía Consumida (Wh)'] = total_energy_j / 3600.0 if total_energy_j else 0
         
-        # Calculate mAh consumed
-        if metrics['I Promedio (A)'] > 0 and metrics['Tiempo de Vuelo (min)'] > 0:
-            metrics['mAh Consumidos'] = metrics['I Promedio (A)'] * 1000 * (metrics['Tiempo de Vuelo (min)'] / 60.0)
+        # Calculate mAh consumed (solo durante vuelo)
+        if metrics['I Promedio (A)'] > 0 and flight_duration_min > 0:
+            metrics['mAh Consumidos'] = metrics['I Promedio (A)'] * 1000 * (flight_duration_min / 60.0)
         else:
             metrics['mAh Consumidos'] = 0
         
@@ -190,6 +254,26 @@ class FlightAnalyzer:
         
         return metrics
 
+    def get_flight_status(self):
+        """Return current flight status for real-time display"""
+        if self.in_flight and self.flight_start_time:
+            current_time = time.time()
+            flight_duration = current_time - self.flight_start_time
+            flight_duration_min = flight_duration / 60.0
+            return {
+                'in_flight': True,
+                'flight_time_min': flight_duration_min,
+                'flight_time_formatted': format_min_sec(flight_duration_min),
+                'voltage_sag': self.voltage_sag_value
+            }
+        else:
+            return {
+                'in_flight': False,
+                'flight_time_min': 0,
+                'flight_time_formatted': "0:00",
+                'voltage_sag': 0
+            }
+
 # --------------- READER THREAD ---------------
 class SysStatusReader(threading.Thread):
     def __init__(self, conn_str, buffers, stop_event, verbose=False):
@@ -200,6 +284,7 @@ class SysStatusReader(threading.Thread):
         self.master = None
         self.verbose = verbose
         self.analyzer = FlightAnalyzer()
+        self.last_status_print = 0
 
     def connect(self):
         try:
@@ -280,20 +365,27 @@ class SysStatusReader(threading.Thread):
                 # Update flight analyzer
                 self.analyzer.update(t, voltage_v, current_a, power_w)
 
-                # Print real-time metrics every 5 seconds
-                if len(self.buffers['t']) % 50 == 0:  # Approximately every 5 seconds
-                    self.print_realtime_metrics(t)
+                # Print real-time status every 3 seconds
+                if t - self.last_status_print >= 3.0:
+                    self.print_realtime_status(t, voltage_v, current_a)
+                    self.last_status_print = t
 
                 last_t = t
 
-    def print_realtime_metrics(self, current_time):
-        """Print real-time metrics during flight"""
-        if self.analyzer.in_flight and self.analyzer.flight_start_time:
-            flight_time = current_time - self.analyzer.flight_start_time
-            print(f"[REALTIME] Flight: {flight_time/60:.1f}min, "
-                  f"Voltage: {self.analyzer.final_voltage:.2f}V, "
-                  f"Current: {self.analyzer.current_sum/max(1, self.analyzer.sample_count):.1f}A, "
-                  f"Power: {self.analyzer.power_sum/max(1, self.analyzer.sample_count):.1f}W")
+    def print_realtime_status(self, current_time, voltage, current):
+        """Print real-time flight status"""
+        status = self.analyzer.get_flight_status()
+        
+        if status['in_flight']:
+            print(f"[EN VUELO] T: {status['flight_time_formatted']}min, "
+                  f"V: {voltage:.2f}V, I: {current:.1f}A, "
+                  f"Sag: {status['voltage_sag']:.2f}V")
+        elif self.analyzer.landing_detected:
+            print(f"[ATERRIZAJE] Vuelo completado: {status['flight_time_formatted']}min")
+        elif self.analyzer.reposo_calculado:
+            print(f"[ESPERANDO] Listo para despegue - V: {voltage:.2f}V, I: {current:.1f}A")
+        else:
+            print(f"[CALIBRANDO] Calculando voltaje de reposo... V: {voltage:.2f}V")
 
     def get_analysis(self):
         """Get flight analysis results"""
@@ -370,12 +462,18 @@ def dump_csv(path, buffers):
 def save_analysis_csv(path, analysis_data):
     """Save flight analysis data to CSV"""
     try:
+        # Crear una copia para el CSV manteniendo los valores numéricos
+        csv_data = {}
+        for key, value in analysis_data.items():
+            if '(formateado)' not in key:  # Excluir campos formateados del CSV
+                csv_data[key] = value
+        
         file_exists = os.path.isfile(path)
         with open(path, 'a', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=analysis_data.keys())
+            writer = csv.DictWriter(f, fieldnames=csv_data.keys())
             if not file_exists:
                 writer.writeheader()
-            writer.writerow(analysis_data)
+            writer.writerow(csv_data)
         print(f"[INFO] Análisis guardado en: {path}")
     except Exception as e:
         print(f"[ERROR] Al guardar análisis: {e}")
@@ -386,26 +484,52 @@ def print_analysis(analysis_data):
     print("ANÁLISIS COMPLETO DE BATERÍA")
     print("="*80)
     
-    for key, value in analysis_data.items():
-        if 'Tiempo' in key:
-            print(f"{key}: {value:.2f}")
-        elif 'Voltaje' in key or 'Caída' in key:
-            print(f"{key}: {value:.2f} V")
-        elif 'mAh' in key:
-            print(f"{key}: {value:.0f}")
-        elif 'C-rate' in key:
-            print(f"{key}: {value:.2f}")
-        elif 'I ' in key or 'Potencia' in key:
-            if 'Máxima' in key or 'Mínimo' in key or 'Máximo' in key:
-                print(f"{key}: {value:.2f}")
+    # Definir el orden y formato de visualización
+    display_fields = [
+        ('Tiempo total (formateado)', 'Tiempo total'),
+        ('Tiempo de Vuelo (formateado)', 'Tiempo de Vuelo'),
+        ('Voltaje Inicial (V)', 'V'),
+        ('Voltaje Final (V)', 'V'),
+        ('Caída de Voltaje(sag) (V)', 'V'),
+        ('Voltaje Mínimo (V)', 'V'), 
+        ('Voltaje Máximo (V)', 'V'),
+        ('mAh Consumidos', ''),
+        ('C-rate Promedio', ''),
+        ('I Máxima (A)', 'A'),
+        ('I Promedio (A)', 'A'),
+        ('Potencia Máxima (W)', 'W'),
+        ('Potencia Promedio (W)', 'W'),
+        ('Energía Consumida (Wh)', 'Wh'),
+        ('SOH', '%'),
+        ('Eficiencia Energética (%)', '%')
+    ]
+    
+    for field, unit in display_fields:
+        if field in analysis_data:
+            value = analysis_data[field]
+            if unit:
+                if field in ['Tiempo total (formateado)', 'Tiempo de Vuelo (formateado)']:
+                    print(f"{field.replace('(formateado)', '(min:seg)')}: {value}")
+                elif 'Voltaje' in field or 'Caída' in field:
+                    print(f"{field}: {value:.2f} {unit}")
+                elif 'I ' in field or 'Potencia' in field:
+                    if 'Máxima' in field or 'Promedio' in field:
+                        print(f"{field}: {value:.2f} {unit}")
+                    else:
+                        print(f"{field}: {value:.2f} {unit}")
+                elif 'Energía' in field:
+                    print(f"{field}: {value:.3f} {unit}")
+                elif 'SOH' in field or 'Eficiencia' in field:
+                    print(f"{field}: {value:.1f}{unit}")
+                else:
+                    print(f"{field}: {value} {unit}")
             else:
-                print(f"{key}: {value:.2f}")
-        elif 'Energía' in key:
-            print(f"{key}: {value:.3f}")
-        elif 'SOH' in key or 'Eficiencia' in key:
-            print(f"{key}: {value:.1f}%")
-        else:
-            print(f"{key}: {value}")
+                if 'mAh' in field:
+                    print(f"{field}: {value:.0f}")
+                elif 'C-rate' in field:
+                    print(f"{field}: {value:.2f}")
+                else:
+                    print(f"{field}: {value}")
     
     print("="*80)
 
@@ -429,9 +553,15 @@ def main():
     args = parse_args()
     
     print("="*80)
-    print("MONITOR DE BATERÍA PARA DRONE")
+    print("MONITOR DE BATERÍA PARA DRONE - DETECCIÓN AUTOMÁTICA DE VUELO")
     print(f"Batería: {BATTERY_CELLS}S {BATTERY_CAPACITY_MAH}mAh {BATTERY_C_RATING}C")
     print(f"Voltaje nominal: {BATTERY_NOMINAL_VOLTAGE:.1f}V")
+    print("="*80)
+    print("INSTRUCCIONES:")
+    print("1. Conecta el drone EN REPOSO (sin armar motores)")
+    print("2. Espera 'Listo para despegue'")
+    print("3. Despega normalmente")
+    print("4. El sistema detectará automáticamente inicio y fin de vuelo")
     print("="*80)
 
     maxlen = args.max_samples if args.max_samples and args.max_samples > 0 else None
