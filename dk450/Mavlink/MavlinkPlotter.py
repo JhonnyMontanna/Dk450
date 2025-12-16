@@ -65,7 +65,7 @@ lons_local = []
 usar_com = False  # True para usar COM, False para usar UDP
 default_com_port = 'COM3'
 default_baudrate = 57600
-default_udp_port = '127.0.0.1:14560'
+default_udp_port = '127.0.0.1:14552'
 
 
 if usar_com:

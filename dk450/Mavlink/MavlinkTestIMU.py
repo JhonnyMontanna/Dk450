@@ -2,7 +2,7 @@ from pymavlink import mavutil
 import time
 
 # Conexión al dron (ajusta según tu sistema)
-master = mavutil.mavlink_connection('udp:127.0.0.1:14551')
+master = mavutil.mavlink_connection('udp:127.0.0.1:14552')
 
 # Esperar el primer mensaje de heartBeat
 master.wait_heartbeat()

@@ -13,7 +13,7 @@ trajectory = []
 connection_string = 'COM3'
 baudrate = 57600
 #master = mavutil.mavlink_connection('udp:127.0.0.1:14551')
-master = mavutil.mavlink_connection('udp:127.0.0.1:14560')
+master = mavutil.mavlink_connection('udp:127.0.0.1:14552')
 #master = mavutil.mavlink_connection(connection_string, baud=baudrate)
 master.wait_heartbeat()
 print("¡Conexión establecida con el dron!")

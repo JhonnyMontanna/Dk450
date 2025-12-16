@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 from collections import deque
 
 # ---------------- Argumentos ----------------
-parser = argparse.ArgumentParser(description="Monitoreo de posición XYZ en tiempo real tipo visualizer")
+parser = argparse.ArgumentParser(description="Monitoreo de posición XYZ en tiempo real")
 parser.add_argument('--conn', default='udp:127.0.0.1:14552', help="Conexión al dron")
 parser.add_argument('--mode', choices=['local','global'], default='global', help="Modo de coordenadas")
 parser.add_argument('--origin-lat', type=float, default=19.595128) #19.5942341)
