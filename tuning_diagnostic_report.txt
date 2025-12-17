@@ -1,0 +1,92 @@
+================================================================================
+DIAGNÓSTICO DE TUNING - DRONE FLIGHT CONTROLLER
+================================================================================
+Archivo analizado: d2-tuning15-dic.bin
+Fecha análisis: 2025-12-16 21:46:18
+================================================================================
+
+==================================================
+ANÁLISIS DE ROLL
+==================================================
+
+--- MÉTRICAS DE ERROR ---
+RMSE: 38.045 grados
+Error Máximo: 557.488 grados
+Error Promedio: -9.741 grados
+Desviación Estándar: 36.777 grados
+Overshoot: 209.2%
+Tiempo de Establecimiento: 51:40
+Retardo: 0.000 seg
+Porcentaje de Tracking: 52.5%
+
+--- ANÁLISIS DE OSCILACIONES ---
+Frecuencia Dominante: 0.13 Hz
+Tasa de Cruce por Cero: 0.21 Hz
+Factor de Cresta: 14.65
+Severidad: LEVE - Monitorear
+
+--- INTEGRALES DE ERROR ---
+IAE (Error Absoluto): 72095.858
+Integral Positiva: 22852.118
+Integral Negativa: 49243.740
+
+--- RECOMENDACIONES DE TUNING ---
+• REDUCIR P_rate (sobrepico excesivo > 20%)
+• AUMENTAR D_rate (amortiguamiento insuficiente)
+• AUMENTAR P_rate (respuesta muy lenta)
+• AUMENTAR I_rate o FeedForward (error de estado estacionario)
+• AUMENTAR filtrado (señal muy ruidosa)
+
+==================================================
+ANÁLISIS DE PITCH
+==================================================
+
+--- MÉTRICAS DE ERROR ---
+RMSE: 42.045 grados
+Error Máximo: 488.733 grados
+Error Promedio: -12.852 grados
+Desviación Estándar: 40.033 grados
+Overshoot: 120.2%
+Tiempo de Establecimiento: 51:22
+Retardo: 0.000 seg
+Porcentaje de Tracking: 33.5%
+
+--- ANÁLISIS DE OSCILACIONES ---
+Frecuencia Dominante: 0.13 Hz
+Tasa de Cruce por Cero: 0.20 Hz
+Factor de Cresta: 11.62
+Severidad: LEVE - Monitorear
+
+--- INTEGRALES DE ERROR ---
+IAE (Error Absoluto): 97791.732
+Integral Positiva: 17849.897
+Integral Negativa: 79941.835
+
+--- RECOMENDACIONES DE TUNING ---
+• REDUCIR P_rate (sobrepico excesivo > 20%)
+• AUMENTAR D_rate (amortiguamiento insuficiente)
+• AUMENTAR P_rate (respuesta muy lenta)
+• AUMENTAR I_rate o FeedForward (error de estado estacionario)
+• AUMENTAR filtrado (señal muy ruidosa)
+
+================================================================================
+COMPARACIÓN ENTRE EJES
+================================================================================
+
+Diferencia Roll - Pitch:
+  RMSE: 4.000 grados
+  Overshoot: 89.0%
+  Frecuencia dominante: 0.00 Hz
+
+================================================================================
+RESUMEN EJECUTIVO
+================================================================================
+Roll: LEVE - Monitorear
+Pitch: LEVE - Monitorear
+
+Acciones recomendadas prioritarias:
+• REDUCIR ganancia P para reducir overshoot
+
+================================================================================
+FIN DEL REPORTE
+================================================================================
