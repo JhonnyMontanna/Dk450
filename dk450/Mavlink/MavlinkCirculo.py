@@ -5,12 +5,12 @@ from pymavlink import mavutil
 
 # Parámetros de conexión y control
 CONN = 'udp:127.0.0.1:14552'  # SITL 60 - 51 con jetson
-SYSID = 2
+SYSID = 1
 COMPID = 0
 
 # Parámetros de la circunferencia
 RADIUS = 1.5              # metros
-ANGULAR_SPEED = 0.8     # rad/s (velocidad angular alrededor del centro)
+ANGULAR_SPEED = 0.9     # rad/s (velocidad angular alrededor del centro)
 LINEAR_SPEED = RADIUS * ANGULAR_SPEED  # v = ω·R
 RATE = 50                  # Hz de envío de comandos
 

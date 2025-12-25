@@ -5,7 +5,7 @@ power_monitor_log_analysis.py
 Análisis completo de consumo energético desde archivo de log MAVLink
 Configuración directa para ejecutar en VS Code
 DETECTA MÚLTIPLES VUELOS CON PENDIENTE DE DESCARGA
-Versión Corregida: Pendientes de descarga y eficiencia energética
+Versión Mejorada: Con offsets configurables para pendientes y mAh destacados
 """
 import time
 import csv
@@ -21,7 +21,7 @@ import numpy as np
 # ==============================================
 
 # RUTA DEL ARCHIVO DE LOG (CAMBIAR ESTA RUTA)
-LOG_FILE = r"C:\Users\jhonn\Documents\Mission Planner\logs\Posibles\Vuelo D2 tuning 12-dic B2.2.tlog"  # Cambia esta ruta
+LOG_FILE = r"C:\Users\jhonn\Documents\Mission Planner\logs\Posibles\D2 Vuelo Guided con RTK 17-dic.tlog"  # Cambia esta ruta
 
 # PARÁMETROS DE BATERÍA (modificar si es necesario)
 BATTERY_CELLS = 3                    # 3S battery
@@ -37,6 +37,11 @@ CURRENT_SPIKE_THRESHOLD = 3.0        # Corriente mínima para detectar despegue 
 LANDING_CURRENT_THRESHOLD = 2.0      # Corriente máxima para detectar aterrizaje (A)
 VOLTAGE_STABILITY_THRESHOLD = 0.05   # Variación máxima de voltaje para estabilidad (V)
 STABLE_PERIOD_REQUIRED = 5           # Muestras estables necesarias para confirmar aterrizaje
+
+# NUEVOS PARÁMETROS PARA CÁLCULO DE PENDIENTES (OFFSETS)
+START_OFFSET_SAMPLES = 5             # Muestras a saltar después del inicio para calcular pendiente
+END_OFFSET_SAMPLES = 5               # Muestras a retroceder antes del fin para calcular pendiente
+MIN_SAMPLES_FOR_SLOPE = 10           # Mínimo de muestras para calcular pendiente
 
 # OPCIONES DE ANÁLISIS (True/False)
 GUARDAR_CSV_CRUDOS = False           # Guardar datos crudos en CSV
@@ -87,7 +92,7 @@ def format_min_sec(total_minutes):
 
 class SingleFlight:
     """Representa un vuelo individual"""
-    def __init__(self, flight_number, start_time, start_voltage):
+    def __init__(self, flight_number, start_time, start_voltage, start_index):
         self.flight_number = flight_number
         self.start_time = start_time
         self.end_time = None
@@ -104,10 +109,19 @@ class SingleFlight:
         self.avg_current = 0
         self.avg_power = 0
         
-        # Pendiente de descarga (V/s)
-        self.discharge_slope = 0  # Voltios por segundo
-        self.time_at_min_voltage = start_time  # Tiempo cuando ocurre el voltaje mínimo
-        self.voltage_at_min_time = start_voltage  # Voltaje en el tiempo mínimo
+        # Pendiente de descarga (V/s) - múltiples métodos
+        self.discharge_slope = 0           # Pendiente original
+        self.discharge_slope_offset = 0    # Pendiente con offsets
+        self.discharge_slope_min = 0       # Pendiente hasta voltaje mínimo
+        self.discharge_slope_manual = 0    # Pendiente manual (para ajustes)
+        
+        self.time_at_min_voltage = start_time
+        self.voltage_at_min_time = start_voltage
+        
+        # Índices para cálculo con offsets
+        self.start_index = start_index
+        self.end_index = None
+        self.min_voltage_index = start_index
         
         # Para calcular promedios
         self.current_sum = 0
@@ -117,10 +131,16 @@ class SingleFlight:
         # Para voltaje sag
         self.voltage_sag = 0
         
-        # Para tracking de la última corriente alta (para detectar fin de vuelo)
+        # Para tracking de la última corriente alta
         self.last_high_current_time = start_time
+        self.last_high_current_index = start_index
         
-    def update(self, timestamp, voltage, current, power, energy_inc_j=0):
+        # Almacenar muestras para análisis posterior
+        self.timestamps_list = []
+        self.voltages_list = []
+        self.currents_list = []
+        
+    def update(self, timestamp, voltage, current, power, energy_inc_j=0, sample_index=None):
         """Actualiza las métricas del vuelo"""
         if voltage is not None:
             # Guardar el tiempo y voltaje mínimo durante el vuelo
@@ -128,9 +148,15 @@ class SingleFlight:
                 self.min_voltage = voltage
                 self.time_at_min_voltage = timestamp
                 self.voltage_at_min_time = voltage
+                if sample_index is not None:
+                    self.min_voltage_index = sample_index
             
             self.max_voltage = max(self.max_voltage, voltage)
             self.end_voltage = voltage
+            
+            # Guardar para análisis de pendiente
+            self.timestamps_list.append(timestamp)
+            self.voltages_list.append(voltage)
             
         if current is not None:
             self.max_current = max(self.max_current, current)
@@ -140,6 +166,11 @@ class SingleFlight:
             # Guardar tiempo de última corriente alta
             if current > 5.0:  # Considerar como "alta" corriente
                 self.last_high_current_time = timestamp
+                if sample_index is not None:
+                    self.last_high_current_index = sample_index
+            
+            # Guardar para análisis
+            self.currents_list.append(current)
             
         if power is not None:
             self.max_power = max(self.max_power, power)
@@ -151,9 +182,80 @@ class SingleFlight:
         if self.start_time is not None and timestamp is not None:
             self.duration = timestamp - self.start_time
     
-    def finalize(self, end_time):
-        """Finaliza el vuelo y calcula promedios y pendiente"""
+    def calculate_slopes(self, global_timestamps=None, global_voltages=None, global_currents=None):
+        """Calcula pendientes usando diferentes métodos"""
+        
+        # Método 1: Original (hasta voltaje mínimo o última corriente alta)
+        end_time_for_slope = min(self.time_at_min_voltage, self.last_high_current_time)
+        
+        if end_time_for_slope > self.start_time and self.min_voltage != float('inf'):
+            time_change = end_time_for_slope - self.start_time
+            if time_change > 1.0:
+                voltage_change = self.min_voltage - self.start_voltage
+                self.discharge_slope = voltage_change / time_change
+            else:
+                self.discharge_slope = 0
+        else:
+            self.discharge_slope = 0
+        
+        # Método 2: Con offsets usando datos globales (si están disponibles)
+        if (global_timestamps is not None and global_voltages is not None and 
+            self.start_index is not None and self.end_index is not None):
+            
+            # Aplicar offsets
+            start_idx = self.start_index + START_OFFSET_SAMPLES
+            end_idx = self.end_index - END_OFFSET_SAMPLES
+            
+            # Asegurar índices válidos
+            if (start_idx < end_idx and 
+                start_idx >= 0 and end_idx < len(global_timestamps) and
+                end_idx - start_idx >= MIN_SAMPLES_FOR_SLOPE):
+                
+                time_change_offset = global_timestamps[end_idx] - global_timestamps[start_idx]
+                voltage_change_offset = global_voltages[end_idx] - global_voltages[start_idx]
+                
+                if time_change_offset > 0.5:  # Al menos 0.5 segundos
+                    self.discharge_slope_offset = voltage_change_offset / time_change_offset
+                else:
+                    self.discharge_slope_offset = 0
+            else:
+                self.discharge_slope_offset = 0
+        
+        # Método 3: Pendiente hasta voltaje mínimo
+        if self.time_at_min_voltage > self.start_time and self.min_voltage != float('inf'):
+            time_to_min = self.time_at_min_voltage - self.start_time
+            if time_to_min > 0.5:
+                self.discharge_slope_min = (self.min_voltage - self.start_voltage) / time_to_min
+            else:
+                self.discharge_slope_min = 0
+        else:
+            self.discharge_slope_min = 0
+        
+        # Método 4: Manual - usar datos internos del vuelo con offsets
+        if len(self.timestamps_list) > MIN_SAMPLES_FOR_SLOPE:
+            start_offset = min(START_OFFSET_SAMPLES, len(self.timestamps_list) // 3)
+            end_offset = min(END_OFFSET_SAMPLES, len(self.timestamps_list) // 3)
+            
+            if len(self.timestamps_list) - end_offset > start_offset:
+                start_idx = start_offset
+                end_idx = len(self.timestamps_list) - end_offset - 1
+                
+                time_change_manual = self.timestamps_list[end_idx] - self.timestamps_list[start_idx]
+                voltage_change_manual = self.voltages_list[end_idx] - self.voltages_list[start_idx]
+                
+                if time_change_manual > 0.5:
+                    self.discharge_slope_manual = voltage_change_manual / time_change_manual
+                else:
+                    self.discharge_slope_manual = 0
+            else:
+                self.discharge_slope_manual = 0
+        else:
+            self.discharge_slope_manual = 0
+    
+    def finalize(self, end_time, end_index=None):
+        """Finaliza el vuelo y calcula promedios"""
         self.end_time = end_time
+        self.end_index = end_index
         self.duration = end_time - self.start_time
         
         # Calcular corriente promedio en vuelo
@@ -165,20 +267,7 @@ class SingleFlight:
         if self.start_voltage is not None and self.min_voltage != float('inf'):
             self.voltage_sag = self.start_voltage - self.min_voltage
         
-        # Calcular pendiente de descarga (V/s) usando el voltaje mínimo
-        # Usamos el tiempo del último pico de corriente o el tiempo del voltaje mínimo, el que sea menor
-        # Esto evita usar datos de recuperación post-aterrizaje
-        end_time_for_slope = min(self.time_at_min_voltage, self.last_high_current_time)
-        
-        if end_time_for_slope > self.start_time and self.min_voltage != float('inf'):
-            time_change = end_time_for_slope - self.start_time
-            if time_change > 1.0:  # Al menos 1 segundo de vuelo
-                voltage_change = self.min_voltage - self.start_voltage
-                self.discharge_slope = voltage_change / time_change  # V/s (normalmente negativo)
-            else:
-                self.discharge_slope = 0
-        else:
-            self.discharge_slope = 0
+        # Las pendientes se calcularán después cuando tengamos los datos globales
     
     def get_metrics(self):
         """Devuelve métricas del vuelo"""
@@ -198,7 +287,13 @@ class SingleFlight:
             'Caída de Voltaje(sag) (V)': self.voltage_sag,
             'Tiempo al Voltaje Mínimo (s)': self.time_at_min_voltage - self.start_time if self.time_at_min_voltage > self.start_time else 0,
             'Pendiente Descarga (V/s)': self.discharge_slope,
-            'Pendiente Descarga (V/min)': self.discharge_slope * 60,  # Convertir a V/min
+            'Pendiente Descarga (V/min)': self.discharge_slope * 60,
+            'Pendiente con Offset (V/s)': self.discharge_slope_offset,
+            'Pendiente con Offset (V/min)': self.discharge_slope_offset * 60,
+            'Pendiente hasta Mínimo (V/s)': self.discharge_slope_min,
+            'Pendiente Manual (V/s)': self.discharge_slope_manual,
+            'Offset Inicio (muestras)': START_OFFSET_SAMPLES,
+            'Offset Fin (muestras)': END_OFFSET_SAMPLES,
             'I Máxima (A)': self.max_current,
             'I Promedio en Vuelo (A)': self.avg_current,
             'Potencia Máxima (W)': self.max_power,
@@ -223,6 +318,7 @@ class FlightAnalyzer:
         self.max_current = 0
         self.max_power = 0
         self.total_energy_j = 0
+        self.total_mah_consumed = 0  # NUEVO: Total de mAh consumidos
         
         # Para múltiples vuelos
         self.flights = []  # Lista de objetos SingleFlight
@@ -250,6 +346,9 @@ class FlightAnalyzer:
         # Para calcular energía incremental
         self.prev_power = None
         self.prev_timestamp = None
+        
+        # Contador de muestras
+        self.sample_counter = 0
         
     def update(self, timestamp, voltage, current, power):
         # Almacenar datos crudos
@@ -305,17 +404,18 @@ class FlightAnalyzer:
                 if voltage_drop > VOLTAGE_SAG_THRESHOLD and current > CURRENT_SPIKE_THRESHOLD:
                     self.flight_counter += 1
                     self.in_flight = True
-                    self.current_flight = SingleFlight(self.flight_counter, timestamp, voltage)
+                    self.current_flight = SingleFlight(self.flight_counter, timestamp, voltage, self.sample_counter)
                     
                     print(f"\n[FLIGHT #{self.flight_counter}] ¡VUELO DETECTADO!")
                     print(f"  Inicio: {timestamp:.1f}s")
                     print(f"  Voltaje inicial: {voltage:.2f}V")
                     print(f"  Corriente: {current:.1f}A")
                     print(f"  Caída de voltaje: {voltage_drop:.2f}V")
+                    print(f"  Índice de muestra: {self.sample_counter}")
         
         # 3. ACTUALIZAR VUELO ACTUAL
         if self.in_flight and self.current_flight is not None:
-            self.current_flight.update(timestamp, voltage, current, power, energy_inc_j)
+            self.current_flight.update(timestamp, voltage, current, power, energy_inc_j, self.sample_counter)
             
             # 4. DETECTAR ATERRIZAJE (corriente baja + voltaje estable)
             if current is not None and current < LANDING_CURRENT_THRESHOLD:
@@ -336,8 +436,12 @@ class FlightAnalyzer:
                         
                         # Si tenemos suficiente tiempo de estabilidad, confirmar aterrizaje
                         if self.stable_voltage_period >= STABLE_PERIOD_REQUIRED:
-                            self.current_flight.finalize(timestamp)
+                            self.current_flight.finalize(timestamp, self.sample_counter)
                             self.flights.append(self.current_flight)
+                            
+                            # Calcular mAh para este vuelo y sumar al total
+                            flight_mah = self.current_flight.avg_current * 1000 * (self.current_flight.duration / 3600.0)
+                            self.total_mah_consumed += flight_mah
                             
                             flight_metrics = self.current_flight.get_metrics()
                             
@@ -348,7 +452,8 @@ class FlightAnalyzer:
                             print(f"  Corriente final: {current:.1f}A")
                             print(f"  I Promedio en vuelo: {flight_metrics['I Promedio en Vuelo (A)']:.1f}A")
                             print(f"  Energía consumida: {flight_metrics['Energía Consumida (Wh)']:.3f} Wh")
-                            print(f"  Pendiente descarga: {flight_metrics['Pendiente Descarga (V/s)']:.4f} V/s ({flight_metrics['Pendiente Descarga (V/min)']:.2f} V/min)")
+                            print(f"  mAh consumidos este vuelo: {flight_mah:.0f} mAh")
+                            print(f"  Pendiente descarga: {flight_metrics['Pendiente Descarga (V/s)']:.4f} V/s")
                             
                             # Reiniciar para próximo vuelo
                             self.in_flight = False
@@ -360,14 +465,21 @@ class FlightAnalyzer:
                 # Corriente alta, no es aterrizaje
                 self.landing_candidate_time = None
                 self.stable_voltage_period = 0
+        
+        # Incrementar contador de muestras
+        self.sample_counter += 1
     
     def finalize(self):
         """Finaliza el análisis (útil si el vuelo no terminó)"""
         if self.in_flight and self.current_flight is not None and self.timestamps:
             # El vuelo estaba en progreso al final del log
             last_timestamp = self.timestamps[-1]
-            self.current_flight.finalize(last_timestamp)
+            self.current_flight.finalize(last_timestamp, self.sample_counter - 1)
             self.flights.append(self.current_flight)
+            
+            # Calcular mAh para este vuelo incompleto
+            flight_mah = self.current_flight.avg_current * 1000 * (self.current_flight.duration / 3600.0)
+            self.total_mah_consumed += flight_mah
             
             flight_metrics = self.current_flight.get_metrics()
             
@@ -375,7 +487,28 @@ class FlightAnalyzer:
             print(f"  Último timestamp: {last_timestamp:.1f}s")
             print(f"  Duración parcial: {flight_metrics['Duración (min:seg)']}")
             print(f"  I Promedio en vuelo: {flight_metrics['I Promedio en Vuelo (A)']:.1f}A")
+            print(f"  mAh consumidos parciales: {flight_mah:.0f} mAh")
             print(f"  Pendiente descarga parcial: {flight_metrics['Pendiente Descarga (V/s)']:.4f} V/s")
+    
+    def calculate_all_slopes(self):
+        """Calcula todas las pendientes para todos los vuelos"""
+        print("\n[INFO] Calculando pendientes de descarga con offsets...")
+        print(f"  Offsets configurados: +{START_OFFSET_SAMPLES} muestras al inicio, -{END_OFFSET_SAMPLES} muestras al fin")
+        
+        # Convertir a arrays numpy
+        timestamps_arr = np.array(self.timestamps)
+        voltages_arr = np.array([v if v is not None else np.nan for v in self.voltages], dtype=np.float64)
+        currents_arr = np.array([c if c is not None else np.nan for c in self.currents], dtype=np.float64)
+        
+        for flight in self.flights:
+            flight.calculate_slopes(timestamps_arr, voltages_arr, currents_arr)
+            
+            if MODO_VERBOSE:
+                print(f"  Vuelo #{flight.flight_number}:")
+                print(f"    Pendiente original: {flight.discharge_slope:.4f} V/s")
+                print(f"    Pendiente con offset: {flight.discharge_slope_offset:.4f} V/s")
+                print(f"    Pendiente hasta mínimo: {flight.discharge_slope_min:.4f} V/s")
+                print(f"    Pendiente manual: {flight.discharge_slope_manual:.4f} V/s")
     
     def get_data_arrays(self):
         """Devuelve arrays numpy de los datos"""
@@ -420,22 +553,29 @@ class FlightAnalyzer:
         total_flight_time = sum(f.duration for f in self.flights)
         total_flight_energy = sum(f.energy_consumed_j for f in self.flights)
         
-        # Calcular mAh totales consumidos en vuelo
-        total_mah_consumed = 0
+        # Calcular mAh totales consumidos en vuelo (usando nuestra variable acumulada)
+        total_mah_consumed = self.total_mah_consumed
+        
+        # También calcular de manera alternativa para verificación
+        total_mah_alternative = 0
         for flight in self.flights:
             if flight.duration > 0 and flight.avg_current > 0:
-                total_mah_consumed += flight.avg_current * 1000 * (flight.duration / 3600.0)
+                total_mah_alternative += flight.avg_current * 1000 * (flight.duration / 3600.0)
+        
+        # Usar el mayor de los dos métodos
+        total_mah_consumed = max(total_mah_consumed, total_mah_alternative)
         
         # Calcular energía teórica disponible
-        # Para una batería LiPo, la energía total = Capacidad (Ah) * Voltaje Nominal (V)
         theoretical_energy_wh = (BATTERY_CAPACITY_MAH / 1000.0) * BATTERY_NOMINAL_VOLTAGE
         
-        # Calcular pendiente de descarga promedio ponderada por duración
+        # Calcular pendiente de descarga promedio ponderada por duración (usando pendiente con offset)
         total_weighted_slope = 0
         total_duration_for_slope = 0
         for flight in self.flights:
             if flight.duration > 0:
-                total_weighted_slope += flight.discharge_slope * flight.duration
+                # Usar pendiente con offset si está disponible, sino la original
+                slope_to_use = flight.discharge_slope_offset if abs(flight.discharge_slope_offset) > 0 else flight.discharge_slope
+                total_weighted_slope += slope_to_use * flight.duration
                 total_duration_for_slope += flight.duration
         
         avg_discharge_slope = total_weighted_slope / total_duration_for_slope if total_duration_for_slope > 0 else 0
@@ -470,6 +610,7 @@ class FlightAnalyzer:
             'C-rate Promedio en Vuelo': avg_current_in_flight / (BATTERY_CAPACITY_MAH / 1000.0) if BATTERY_CAPACITY_MAH > 0 else 0,
             'Pendiente Descarga Promedio (V/s)': avg_discharge_slope,
             'Pendiente Descarga Promedio (V/min)': avg_discharge_slope * 60,
+            'Offsets Configurados': f"+{START_OFFSET_SAMPLES}/-{END_OFFSET_SAMPLES} muestras",
         }
         
         # Calcular SOH basado en voltaje inicial
@@ -485,12 +626,11 @@ class FlightAnalyzer:
             actual_energy_wh = self.total_energy_j / 3600.0
             
             # La eficiencia debe estar relacionada con la capacidad usada
-            # Si usamos X% de la capacidad, deberíamos extraer X% de la energía teórica
             theoretical_energy_used_wh = theoretical_energy_wh * (capacity_percent_used / 100.0)
             
             if theoretical_energy_used_wh > 0:
                 efficiency = (actual_energy_wh / theoretical_energy_used_wh) * 100
-                metrics['Eficiencia Energética (%)'] = min(120.0, max(0.0, efficiency))  # Limitar a rango razonable
+                metrics['Eficiencia Energética (%)'] = min(120.0, max(0.0, efficiency))
             else:
                 metrics['Eficiencia Energética (%)'] = 100.0
         else:
@@ -587,6 +727,9 @@ def process_log_file(log_file, verbose=False):
         # Finalizar vuelos en progreso
         analyzer.finalize()
         
+        # Calcular todas las pendientes
+        analyzer.calculate_all_slopes()
+        
         mlog.close()
         return analyzer
         
@@ -616,7 +759,7 @@ def plot_complete_flight(analyzer):
     # Ajustar tiempos para comenzar desde 0
     t0 = data['timestamps'][0]
     time_rel = data['timestamps'] - t0
-    total_duration = time_rel[-1]  # Definir aquí para usarlo después
+    total_duration = time_rel[-1]
     
     # 1. Voltaje vs Tiempo
     axs[0].plot(time_rel, data['voltages'], 'b-', linewidth=1.5, label='Voltaje (V)')
@@ -637,14 +780,16 @@ def plot_complete_flight(analyzer):
         axs[0].axvline(x=start_rel, color='g', linestyle='--', alpha=0.7, linewidth=1)
         axs[0].axvline(x=end_rel, color='r', linestyle='--', alpha=0.7, linewidth=1)
         
-        # Mostrar pendiente de descarga en la gráfica
-        if flight.discharge_slope != 0:
+        # Mostrar pendiente de descarga en la gráfica (usando pendiente con offset)
+        slope_to_display = flight.discharge_slope_offset if abs(flight.discharge_slope_offset) > 0 else flight.discharge_slope
+        
+        if slope_to_display != 0:
             # Calcular posición para el texto (mitad del vuelo)
             mid_point = (start_rel + end_rel) / 2
             y_pos = axs[0].get_ylim()[0] + (axs[0].get_ylim()[1] - axs[0].get_ylim()[0]) * 0.1
             
             # Formatear pendiente (mostrar valor absoluto si es negativo)
-            slope_val = abs(flight.discharge_slope)
+            slope_val = abs(slope_to_display)
             slope_text = f"{slope_val:.4f} V/s"
             
             axs[0].text(mid_point, y_pos, slope_text, 
@@ -718,7 +863,8 @@ def plot_complete_flight(analyzer):
     
     fig.suptitle(f'Análisis de Consumo - {display_filename}\n'
                  f'Duración total: {format_min_sec(total_duration/60.0)} - '
-                 f'Vuelos detectados: {len(analyzer.flights)}', 
+                 f'Vuelos detectados: {len(analyzer.flights)} - '
+                 f'Offsets: +{START_OFFSET_SAMPLES}/-{END_OFFSET_SAMPLES} muestras', 
                  fontsize=14, fontweight='bold')
     
     plt.tight_layout()
@@ -742,6 +888,9 @@ def print_flight_details(flights):
         print(f"  Voltaje mínimo: {metrics['Voltaje Mínimo (V)']:.2f}V (a {metrics['Tiempo al Voltaje Mínimo (s)']:.1f}s)")
         print(f"  Sag inicial: {metrics['Caída de Voltaje(sag) (V)']:.2f}V")
         print(f"  Pendiente descarga: {metrics['Pendiente Descarga (V/s)']:.4f} V/s ({metrics['Pendiente Descarga (V/min)']:.2f} V/min)")
+        print(f"  Pendiente con offset: {metrics['Pendiente con Offset (V/s)']:.4f} V/s ({metrics['Pendiente con Offset (V/min)']:.2f} V/min)")
+        print(f"  Pendiente hasta mínimo: {metrics['Pendiente hasta Mínimo (V/s)']:.4f} V/s")
+        print(f"  Pendiente manual: {metrics['Pendiente Manual (V/s)']:.4f} V/s")
         print(f"  Corriente: Prom {metrics['I Promedio en Vuelo (A)']:.1f}A, Max {metrics['I Máxima (A)']:.1f}A")
         print(f"  Potencia: Prom {metrics['Potencia Promedio (W)']:.1f}W, Max {metrics['Potencia Máxima (W)']:.1f}W")
         print(f"  Energía: {metrics['Energía Consumida (Wh)']:.3f} Wh")
@@ -753,6 +902,21 @@ def print_global_analysis(global_metrics):
     print("\n" + "="*80)
     print("ANÁLISIS GLOBAL COMPLETO")
     print("="*80)
+    
+    # Mostrar mAh consumidos de manera destacada primero
+    if 'mAh Consumidos Totales' in global_metrics:
+        total_mah = global_metrics['mAh Consumidos Totales']
+        capacity = global_metrics['Capacidad Batería (mAh)']
+        percent_used = global_metrics['Porcentaje Capacidad Usada (%)']
+        
+        print(f"\n{'='*50}")
+        print(f"RESUMEN DE CONSUMO DE BATERÍA:")
+        print(f"{'='*50}")
+        print(f"  Capacidad total: {capacity:.0f} mAh")
+        print(f"  mAh consumidos:  {total_mah:.0f} mAh")
+        print(f"  Porcentaje usado: {percent_used:.1f}%")
+        print(f"  mAh restantes:   {capacity - total_mah:.0f} mAh")
+        print(f"{'='*50}\n")
     
     display_fields = [
         ('Archivo', ''),
@@ -772,13 +936,14 @@ def print_global_analysis(global_metrics):
         ('Potencia Promedio Global (W)', 'W'),
         ('Energía Consumida Total (Wh)', 'Wh'),
         ('Energía Consumida en Vuelo (Wh)', 'Wh'),
-        ('mAh Consumidos Totales', ''),
-        ('Capacidad Batería (mAh)', ''),
+        ('mAh Consumidos Totales', 'mAh'),
+        ('Capacidad Batería (mAh)', 'mAh'),
         ('Porcentaje Capacidad Usada (%)', '%'),
         ('C-rate Promedio Global', ''),
         ('C-rate Promedio en Vuelo', ''),
         ('Pendiente Descarga Promedio (V/s)', 'V/s'),
         ('Pendiente Descarga Promedio (V/min)', 'V/min'),
+        ('Offsets Configurados', ''),
         ('SOH', '%'),
         ('Eficiencia Energética (%)', '%')
     ]
@@ -801,6 +966,8 @@ def print_global_analysis(global_metrics):
                     print(f"{field}: {value:.1f}{unit}")
                 elif 'C-rate' in field:
                     print(f"{field}: {value:.2f}")
+                elif 'Offsets' in field:
+                    print(f"{field}: {value}")
                 else:
                     print(f"{field}: {value} {unit}")
             else:
@@ -886,9 +1053,15 @@ def main():
     """Función principal - Ejecuta el análisis"""
     print("="*80)
     print("ANÁLISIS COMPLETO DE CONSUMO ENERGÉTICO - MÚLTIPLES VUELOS")
+    print("VERSIÓN MEJORADA: CON OFFSETS PARA PENDIENTES")
+    print("="*80)
     print(f"Batería: {BATTERY_CELLS}S {BATTERY_CAPACITY_MAH}mAh {BATTERY_C_RATING}C")
     print(f"Voltajes: Lleno={BATTERY_FULL_VOLTAGE:.1f}V, Nominal={BATTERY_NOMINAL_VOLTAGE:.1f}V, Vacío={BATTERY_EMPTY_VOLTAGE:.1f}V")
     print(f"Archivo de log: {LOG_FILE}")
+    print(f"\nParámetros de cálculo de pendientes:")
+    print(f"  Offset inicio: +{START_OFFSET_SAMPLES} muestras")
+    print(f"  Offset fin: -{END_OFFSET_SAMPLES} muestras")
+    print(f"  Mínimo muestras para pendiente: {MIN_SAMPLES_FOR_SLOPE}")
     print("="*80)
     
     # Verificar que el archivo existe
@@ -915,7 +1088,8 @@ def main():
             metrics = flight.get_metrics()
             print(f"Vuelo #{flight.flight_number}: {metrics['Duración (min:seg)']}, "
                   f"I Promedio: {metrics['I Promedio en Vuelo (A)']:.1f}A, "
-                  f"Pendiente: {abs(metrics['Pendiente Descarga (V/s)']):.4f} V/s")
+                  f"Pendiente (offset): {abs(metrics['Pendiente con Offset (V/s)']):.4f} V/s, "
+                  f"mAh: {metrics['mAh Consumidos']:.0f}")
     
     # Mostrar detalles de cada vuelo
     if analyzer.flights:
@@ -939,10 +1113,11 @@ def main():
     elif GUARDAR_ANALISIS_CSV:
         print("[INFO] Sin vuelos detectados - análisis no guardado")
     
-    print(f"[INFO] Proceso completado exitosamente")
+    print(f"\n[INFO] Proceso completado exitosamente")
     print(f"[INFO] Muestras procesadas: {len(analyzer.timestamps)}")
     print(f"[INFO] Vuelos detectados: {len(analyzer.flights)}")
     print(f"[INFO] Archivo analizado: {LOG_FILE}")
+    print(f"[INFO] Offsets usados: +{START_OFFSET_SAMPLES}/-{END_OFFSET_SAMPLES} muestras")
 
 # ==============================================
 # EJECUCIÓN
@@ -961,6 +1136,10 @@ if __name__ == "__main__":
     print(f"  Umbral corriente despegue: {CURRENT_SPIKE_THRESHOLD} A")
     print(f"  Umbral corriente aterrizaje: {LANDING_CURRENT_THRESHOLD} A")
     print(f"  Estabilidad voltaje: {VOLTAGE_STABILITY_THRESHOLD} V")
+    print(f"\nParámetros de cálculo de pendientes:")
+    print(f"  Offset inicio: +{START_OFFSET_SAMPLES} muestras")
+    print(f"  Offset fin: -{END_OFFSET_SAMPLES} muestras")
+    print(f"  Mínimo muestras: {MIN_SAMPLES_FOR_SLOPE}")
     print("="*80)
     
     # Preguntar confirmación antes de continuar
