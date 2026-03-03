@@ -9,8 +9,8 @@ SYSID = 1
 COMPID = 0
 
 # Parámetros de la circunferencia
-RADIUS = 1.5              # metros
-ANGULAR_SPEED = 0.9     # rad/s (velocidad angular alrededor del centro)
+RADIUS = 4.0              # metros
+ANGULAR_SPEED = 0.4     # rad/s (velocidad angular alrededor del centro)
 LINEAR_SPEED = RADIUS * ANGULAR_SPEED  # v = ω·R
 RATE = 50                  # Hz de envío de comandos
 
