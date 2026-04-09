@@ -11,9 +11,9 @@ CONN = 'udp:127.0.0.1:14552'
 SYSID = 2
 COMPID = 0
 
-RATE = 15
-RADIUS = 1.0
-ANGULAR_SPEED = 0.3
+RATE =25
+RADIUS = 2.0
+ANGULAR_SPEED = 0.4
 
 # ===============================
 # MASK: posición + yaw

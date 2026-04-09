@@ -12,27 +12,35 @@ CONN = 'udp:127.0.0.1:14552'   # SITL
 SYSID = 1
 COMPID = 0
 
-RADIUS = 4.0
-ANGULAR_SPEED = 0.4
-LINEAR_SPEED = RADIUS * ANGULAR_SPEED
-RATE = 50                      # Hz de envío
+RADIUS = 4.0                    # metros
+ANGULAR_SPEED = 1.0              # rad/s (velocidad angular)
+RATE = 50                        # Hz de envío de setpoints
 
-# Máscara para usar SOLO vx, vy, vz (ignorar todo lo demás)
-TYPE_MASK = 0b0000111111000111
+# Máscara para usar posición + yaw (ignorar velocidades, aceleraciones, yaw_rate)
+TYPE_MASK_POS_YAW = (
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_VX_IGNORE |
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_VY_IGNORE |
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_VZ_IGNORE |
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE |
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE |
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE |
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
+)
 
 # ===============================
 # FUNCIONES AUXILIARES
 # ===============================
-def send_velocity(master, vx, vy, vz=0.0):
-    """Envía comando de velocidad en el frame LOCAL_NED"""
+def send_position_yaw(master, x, y, z, yaw):
+    """Envía setpoint de posición (x,y,z) y yaw (ángulo de guiñada)"""
     master.mav.set_position_target_local_ned_send(
         0, SYSID, COMPID,
         mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-        TYPE_MASK,
-        0, 0, 0,                # posiciones ignoradas
-        vx, vy, vz,             # velocidades
-        0, 0, 0,                # aceleraciones ignoradas
-        0, 0                    # yaw, yaw_rate ignorados
+        TYPE_MASK_POS_YAW,
+        x, y, z,
+        0, 0, 0,          # velocidades ignoradas
+        0, 0, 0,          # aceleraciones ignoradas
+        yaw,              # yaw (rad)
+        0                  # yaw_rate ignorado
     )
 
 def wait_local_position(master):
@@ -42,70 +50,81 @@ def wait_local_position(master):
         if msg:
             return msg
 
-def circle_motion_with_logging(master, duration, x0, y0):
+def fly_circle_closed_loop(master, duration):
     """
-    Ejecuta el movimiento circular durante 'duration' segundos,
-    registrando tiempo, setpoints de velocidad y valores reales.
+    Ejecuta un círculo durante 'duration' segundos enviando setpoints de posición.
+    Registra tiempo, setpoints, posición real y velocidad real.
     """
-    dt = 1.0 / RATE
-    steps = int(duration * RATE)
+    # Obtener posición inicial (hover)
+    pos0 = wait_local_position(master)
+    x0, y0, z0 = pos0.x, pos0.y, pos0.z
+    print(f"📍 Posición inicial: x={x0:.2f}, y={y0:.2f}, z={z0:.2f}")
 
-    # Listas para logging
+    # Centro del círculo: desplazado para que el punto inicial esté sobre el círculo
+    cx = x0 + RADIUS
+    cy = y0
+    theta0 = math.pi   # Ángulo inicial: apunta a la izquierda, justo en (x0,y0)
+
+    # Logs
     t_log = []
-    vx_sp_log, vy_sp_log = [], []
+    x_sp_log, y_sp_log = [], []
     x_log, y_log = [], []
     vx_real_log, vy_real_log = [], []
+    vx_des_log, vy_des_log = [], []
 
-    print(f"🌀 Ejecutando círculo durante {duration:.1f} s, registrando datos...")
-    t0 = time.time()
+    dt = 1.0 / RATE
+    steps = int(duration / dt)
+
+    print(f"🌀 Volando círculo: R={RADIUS} m, ω={ANGULAR_SPEED} rad/s, duración={duration:.1f} s")
+    t_start = time.time()
 
     for i in range(steps):
-        t = time.time() - t0
-        theta = ANGULAR_SPEED * t
+        t = time.time() - t_start
+        theta = theta0 + ANGULAR_SPEED * t
 
-        # Setpoints de velocidad (para círculo centrado en (x0,y0) con radio RADIUS)
-        vx_sp = LINEAR_SPEED * math.cos(theta + math.pi/2)
-        vy_sp = LINEAR_SPEED * math.sin(theta + math.pi/2)
+        # Setpoint de posición
+        x_sp = cx + RADIUS * math.cos(theta)
+        y_sp = cy + RADIUS * math.sin(theta)
+        yaw = theta + math.pi/2   # Apuntar en dirección tangencial (opcional)
 
-        # Enviar comando
-        send_velocity(master, vx_sp, vy_sp)
+        send_position_yaw(master, x_sp, y_sp, z0, yaw)
 
-        # Leer estado real (sin bloquear)
+        # Velocidad deseada (derivada de la posición)
+        vx_des = -RADIUS * ANGULAR_SPEED * math.sin(theta)
+        vy_des =  RADIUS * ANGULAR_SPEED * math.cos(theta)
+
+        # Leer estado real (sin bloquear para mantener frecuencia)
         msg = master.recv_match(type='LOCAL_POSITION_NED', blocking=False)
         if msg:
+            t_log.append(t)
+            x_sp_log.append(x_sp)
+            y_sp_log.append(y_sp)
             x_log.append(msg.x)
             y_log.append(msg.y)
             vx_real_log.append(msg.vx)
             vy_real_log.append(msg.vy)
-            # Guardamos el setpoint asociado a este instante (usamos el mismo tiempo)
-            t_log.append(t)
-            vx_sp_log.append(vx_sp)
-            vy_sp_log.append(vy_sp)
+            vx_des_log.append(vx_des)
+            vy_des_log.append(vy_des)
 
-        # Mantener la frecuencia
         time.sleep(dt)
 
-    # Detener al finalizar
-    send_velocity(master, 0.0, 0.0)
-    print("⏹️ Movimiento finalizado, dron detenido.")
+    # Al terminar, enviar un último setpoint para mantener la posición final (opcional)
+    send_position_yaw(master, x_sp, y_sp, z0, yaw)
+    print("⏹️ Vuelo terminado, dron en posición final.")
 
-    return t_log, vx_sp_log, vy_sp_log, x_log, y_log, vx_real_log, vy_real_log
+    return (t_log, x_sp_log, y_sp_log, x_log, y_log,
+            vx_real_log, vy_real_log, vx_des_log, vy_des_log, x0, y0)
 
-def plot_results(t, vx_sp, vy_sp, x, y, vx_real, vy_real, x0, y0, R, omega):
+def plot_results(t, x_sp, y_sp, x, y, vx_real, vy_real, vx_des, vy_des, x0, y0):
     """
-    Genera las gráficas:
-      - Velocidades en X e Y (setpoint vs real)
-      - Trayectoria en XY (real + círculo teórico)
+    Genera las gráficas solicitadas:
+      - Velocidades X e Y (setpoint vs real)
+      - Trayectoria XY (real + círculo teórico)
     """
-    # Cálculo del círculo teórico para comparación en XY
-    t_theory = np.linspace(0, max(t), 300)
-    x_theory = x0 + R * np.cos(omega * t_theory)
-    y_theory = y0 + R * np.sin(omega * t_theory)
-
     # 1) Velocidad en X
     plt.figure(figsize=(10, 4))
-    plt.plot(t, vx_sp, 'b-', label='Vx setpoint')
-    plt.plot(t, vx_real, 'r--', label='Vx real')
+    plt.plot(t, vx_des, 'b-', linewidth=1.5, label='Vx deseada')
+    plt.plot(t, vx_real, 'r--', linewidth=1.5, label='Vx real')
     plt.xlabel('Tiempo [s]')
     plt.ylabel('Vx [m/s]')
     plt.legend()
@@ -114,8 +133,8 @@ def plot_results(t, vx_sp, vy_sp, x, y, vx_real, vy_real, x0, y0, R, omega):
 
     # 2) Velocidad en Y
     plt.figure(figsize=(10, 4))
-    plt.plot(t, vy_sp, 'b-', label='Vy setpoint')
-    plt.plot(t, vy_real, 'r--', label='Vy real')
+    plt.plot(t, vy_des, 'b-', linewidth=1.5, label='Vy deseada')
+    plt.plot(t, vy_real, 'r--', linewidth=1.5, label='Vy real')
     plt.xlabel('Tiempo [s]')
     plt.ylabel('Vy [m/s]')
     plt.legend()
@@ -125,7 +144,12 @@ def plot_results(t, vx_sp, vy_sp, x, y, vx_real, vy_real, x0, y0, R, omega):
     # 3) Trayectoria en el plano XY
     plt.figure(figsize=(6, 6))
     plt.plot(x, y, 'r-', linewidth=2, label='Trayectoria real')
-    plt.plot(x_theory, y_theory, 'b--', linewidth=1.5, label='Círculo teórico')
+    plt.plot(x_sp, y_sp, 'b--', linewidth=1.5, label='Setpoints de posición')
+    # Círculo teórico continuo (para referencia)
+    theta_theory = np.linspace(0, 2*math.pi, 300)
+    x_theory = (x0 + RADIUS) + RADIUS * np.cos(theta_theory)
+    y_theory = y0 + RADIUS * np.sin(theta_theory)
+    plt.plot(x_theory, y_theory, 'g:', linewidth=1, label='Círculo teórico')
     plt.scatter(x0, y0, c='k', marker='o', label='Inicio')
     plt.xlabel('X [m]')
     plt.ylabel('Y [m]')
@@ -140,27 +164,19 @@ def plot_results(t, vx_sp, vy_sp, x, y, vx_real, vy_real, x0, y0, R, omega):
 # PROGRAMA PRINCIPAL
 # ===============================
 if __name__ == '__main__':
-    # 1) Conexión
+    # Conexión
     master = mavutil.mavlink_connection(CONN)
     master.wait_heartbeat()
     print(f"🔗 Conectado: SYS={master.target_system} COMP={master.target_component}")
 
-    # 2) Obtener posición inicial (suponemos que el dron ya está en hover)
-    pos0 = wait_local_position(master)
-    x0, y0 = pos0.x, pos0.y
-    print(f"📍 Posición inicial: x={x0:.2f}, y={y0:.2f}")
+    # Duración del círculo completo (2π rad)
+    duration = 2 * math.pi / ANGULAR_SPEED
 
-    # 3) Duración del círculo completo (2π rad)
-    circle_duration = 2 * math.pi / ANGULAR_SPEED
-    print(f"🌀 Radio = {RADIUS} m, ω = {ANGULAR_SPEED} rad/s, duración ≈ {circle_duration:.1f} s")
+    # Ejecutar vuelo circular con lazo cerrado
+    (t, x_sp, y_sp, x, y, vx_real, vy_real, vx_des, vy_des, x0, y0) = fly_circle_closed_loop(master, duration)
 
-    # 4) Ejecutar movimiento y registrar
-    t, vx_sp, vy_sp, x, y, vx_real, vy_real = circle_motion_with_logging(
-        master, circle_duration, x0, y0
-    )
-
-    # 5) Cerrar conexión
+    # Cerrar conexión
     master.close()
 
-    # 6) Graficar
-    plot_results(t, vx_sp, vy_sp, x, y, vx_real, vy_real, x0, y0, RADIUS, ANGULAR_SPEED)
+    # Graficar resultados
+    plot_results(t, x_sp, y_sp, x, y, vx_real, vy_real, vx_des, vy_des, x0, y0)

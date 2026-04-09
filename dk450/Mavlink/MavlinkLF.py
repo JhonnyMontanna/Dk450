@@ -14,11 +14,11 @@ from pymavlink import mavutil
 # Parámetros configurables
 # ----------------------------------------------------------------------
 CONNECTION_STRING = 'udp:127.0.0.1:14552'  # Ajustar según entorno
-LEADER_SYSID = 1       # System ID del dron líder
-FOLLOWER_SYSID = 2     # System ID del dron seguidor (el que controlamos)
+LEADER_SYSID = 2       # System ID del dron líder
+FOLLOWER_SYSID = 1     # System ID del dron seguidor (el que controlamos)
 
 # Offset deseado respecto al líder (X, Y, Z) en metros (Z positivo hacia arriba)
-OFFSET = (1.0, 0.0, 1.5)
+OFFSET = (1.0, 0.0, 1.0)
 
 # Ganancias PID
 KP = 0.5
