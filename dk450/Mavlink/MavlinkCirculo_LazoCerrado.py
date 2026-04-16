@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
 """
-Seguimiento de trayectoria circular en lazo cerrado usando control proporcional de velocidad.
-Requiere: pymavlink, matplotlib, numpy.
-"""
+Vuelo circular — control en lazo cerrado con path following
+===========================================================
+El problema del código anterior era open-loop en tiempo:
+  theta = theta0 + omega * t
+Si el dron se retrasa, el setpoint sigue avanzando y el error crece sin límite.
 
+Solución: path following con proyección
+  1. En cada ciclo medir theta_real = atan2(dron - centro)
+  2. Setpoint = punto del círculo en (theta_real + lookahead_angle)
+  3. Si el dron está fuera/dentro del radio, corregir radialmente
+
+Esto garantiza que el setpoint SIEMPRE esté por delante del dron,
+no por delante de donde el dron debería estar según el reloj.
+"""
 import time
 import math
+import threading
+from collections import deque
 from pymavlink import mavutil
 import matplotlib.pyplot as plt
 import numpy as np
@@ -13,280 +25,344 @@ import numpy as np
 # ===============================
 # CONFIGURACIÓN
 # ===============================
-CONN = 'udp:127.0.0.1:14552'   # Conexión al SITL (ajustar según corresponda)
-SYSID = 1                      # Normalmente 1 para el autopiloto
-COMPID = 0
+CONN          = 'udp:127.0.0.1:14552'   # SITL — cambiar a IP Jetson en real
+SYSID         = 1
+COMPID        = 0
+RADIUS        = 3.0     # metros
+ANGULAR_SPEED = 0.5     # rad/s
+RATE          = 20      # Hz
 
-# Parámetros del círculo
-RADIUS = 1.5                    # metros
-ANGULAR_SPEED = 0.4             # rad/s (velocidad angular del setpoint)
-CENTER_OFFSET = (0.0, 0.0)      # centro del círculo relativo a la posición inicial? 
-                                # Aquí asumimos que el círculo se centra en la posición inicial.
+# ── Parámetros del lazo cerrado ──────────────────────────────────────────────
+# Lookahead: cuánto adelantar el setpoint respecto a la posición proyectada.
+# Valor = tiempo_de_anticipación * omega.
+# Demasiado pequeño → dron persigue su propia sombra, oscila.
+# Demasiado grande → corta esquinas, el círculo se deforma.
+# Recomendado: entre 0.5 y 1.5 ciclos de control.
+LOOKAHEAD_TIME   = 1.5          # segundos de anticipación
+LOOKAHEAD_ANGLE  = ANGULAR_SPEED * LOOKAHEAD_TIME  # rad
 
-# Parámetros del controlador
-KP = 1.0                        # Ganancia proporcional (m/s por metro de error)
+# Corrección radial: si el dron está a (R + err_r) del centro,
+# desplazar el setpoint K_RADIAL * err_r metros hacia el círculo.
+# Actúa como un resorte que empuja al dron de vuelta al radio correcto.
+# Valores entre 0.3 y 0.8 funcionan bien. 0 = sin corrección radial.
+K_RADIAL = 0.5
 
-# Frecuencia de control (Hz)
-RATE = 20                       # Envío de comandos a 20 Hz
-DT = 1.0 / RATE
+# Criterio de convergencia (fase de cola)
+CONV_RADIUS   = 0.15    # m
+CONV_SPEED    = 0.10    # m/s
+CONV_HOLD     = 1.0     # s
+CONV_TIMEOUT  = 15.0    # s
 
-# Duración total del vuelo (tiempo para dar una vuelta completa)
-DURATION = 2 * math.pi / ANGULAR_SPEED   # Tiempo para 2π radianes
-
-# Máscara para comandos de velocidad (ignorar posiciones, aceleraciones, yaw)
-TYPE_MASK_VEL_ONLY = (
-    mavutil.mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE |
-    mavutil.mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE |
-    mavutil.mavlink.POSITION_TARGET_TYPEMASK_Z_IGNORE |
+# Máscara: usar posición + yaw, ignorar velocidades / aceleraciones / yaw_rate
+TYPE_MASK_POS_YAW = (
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_VX_IGNORE |
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_VY_IGNORE |
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_VZ_IGNORE |
     mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE |
     mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE |
     mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE |
-    mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE |
     mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
 )
 
 # ===============================
+# ESTADO COMPARTIDO
+# ===============================
+_state_lock = threading.Lock()
+_latest_pos = None
+
+
+def _mavlink_reader(master, stop_event):
+    global _latest_pos
+    while not stop_event.is_set():
+        msg = master.recv_match(type='LOCAL_POSITION_NED', blocking=True, timeout=0.1)
+        if msg:
+            with _state_lock:
+                _latest_pos = msg
+
+
+def get_latest_pos():
+    with _state_lock:
+        return _latest_pos
+
+
+# ===============================
 # FUNCIONES AUXILIARES
 # ===============================
-def wait_heartbeat(master):
-    """Espera un heartbeat y muestra información de conexión"""
-    master.wait_heartbeat()
-    print(f"✅ Heartbeat recibido. Sistema {master.target_system}, componente {master.target_component}")
-
-def get_local_position(master):
-    """Espera y retorna el último mensaje LOCAL_POSITION_NED (bloqueante)"""
-    msg = master.recv_match(type='LOCAL_POSITION_NED', blocking=True)
-    return msg
-
-def send_velocity(master, vx, vy, vz=0.0):
-    """Envía un comando de velocidad en el frame LOCAL_NED"""
+def send_position_yaw(master, x, y, z, yaw):
     master.mav.set_position_target_local_ned_send(
-        0,                      # tiempo (ignorado)
-        SYSID, COMPID,
+        0, SYSID, COMPID,
         mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-        TYPE_MASK_VEL_ONLY,
-        0, 0, 0,                # posiciones (ignoradas)
-        vx, vy, vz,             # velocidades (m/s)
-        0, 0, 0,                # aceleraciones (ignoradas)
-        0, 0                     # yaw, yaw_rate (ignorados)
+        TYPE_MASK_POS_YAW,
+        x, y, z,
+        0, 0, 0,
+        0, 0, 0,
+        yaw,
+        0
     )
 
-def arm_and_takeoff(master, target_altitude):
+
+def wait_position_ready():
+    print("⏳ Esperando posición inicial...", end='', flush=True)
+    while get_latest_pos() is None:
+        time.sleep(0.02)
+    print(" listo.")
+    return get_latest_pos()
+
+
+def compute_setpoint(pos_x, pos_y, cx, cy, z0):
     """
-    Arma y despega a una altitud objetivo.
-    Nota: El dron debe estar en modo GUIDED.
+    Núcleo del lazo cerrado.
+
+    1. Proyectar la posición real del dron sobre el círculo:
+       theta_real = atan2(dron_y - cy, dron_x - cx)
+
+    2. Calcular el error radial (distancia al círculo):
+       r_real    = distancia del dron al centro
+       err_r     = r_real - RADIUS  (>0 si está fuera, <0 si está dentro)
+
+    3. Setpoint tangencial = punto del círculo en (theta_real + LOOKAHEAD_ANGLE)
+
+    4. Corrección radial: desplazar el setpoint hacia el radio correcto
+       proporcional al error:
+       x_sp += -K_RADIAL * err_r * cos(theta_real)
+       y_sp += -K_RADIAL * err_r * sin(theta_real)
+       (el signo negativo empuja hacia el interior si err_r > 0)
+
+    Retorna: (x_sp, y_sp, yaw, theta_real, err_r)
     """
-    # Armar
-    master.mav.command_long_send(
-        master.target_system, master.target_component,
-        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        0, 1, 0, 0, 0, 0, 0, 0
-    )
-    print("🔄 Armando...")
-    time.sleep(2)
+    dx = pos_x - cx
+    dy = pos_y - cy
+    r_real    = math.hypot(dx, dy)
+    theta_real = math.atan2(dy, dx)
+    err_r     = r_real - RADIUS
 
-    # Despegue (takeoff)
-    master.mav.command_long_send(
-        master.target_system, master.target_component,
-        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-        0, 0, 0, 0, 0, 0, 0, target_altitude
-    )
-    print(f"🛫 Despegando a {target_altitude} m...")
+    # Ángulo del setpoint tangencial (adelantado)
+    theta_sp = theta_real + LOOKAHEAD_ANGLE
 
-    # Esperar a alcanzar altitud (monitorear posición relativa)
-    while True:
-        msg = master.recv_match(type='LOCAL_POSITION_NED', blocking=True)
-        if msg and abs(msg.z + target_altitude) < 0.5:  # NED: z negativo hacia arriba
-            print("✅ Altitud alcanzada.")
-            break
-        time.sleep(0.1)
+    # Punto sobre el círculo ideal
+    x_sp = cx + RADIUS * math.cos(theta_sp)
+    y_sp = cy + RADIUS * math.sin(theta_sp)
+
+    # Corrección radial: empuja al setpoint hacia la dirección del centro
+    # cuando el dron está fuera del radio, y al contrario si está adentro
+    radial_correction = K_RADIAL * err_r
+    x_sp -= radial_correction * math.cos(theta_real)
+    y_sp -= radial_correction * math.sin(theta_real)
+
+    # Yaw tangencial al círculo en el punto del setpoint
+    yaw = theta_sp + math.pi / 2
+
+    return x_sp, y_sp, yaw, theta_real, err_r
+
 
 # ===============================
-# BUCLE PRINCIPAL DE CONTROL
+# LOOP DE CONTROL EN LAZO CERRADO
 # ===============================
-def closed_loop_circle(master, center_x, center_y, z, radius, omega, duration, kp, dt):
+def fly_circle_closed_loop(master, cx, cy, z0, duration):
     """
-    Ejecuta el seguimiento de círculo en lazo cerrado durante 'duration' segundos.
-    Retorna los logs de tiempo, setpoints y reales.
+    Ejecuta el círculo con path following durante 'duration' segundos.
+    El dron debe comenzar aproximadamente sobre el círculo.
     """
-    t0 = time.time()
+    dt    = 1.0 / RATE
     steps = int(duration / dt)
 
-    # Logs
-    t_log = []
-    x_sp_log, y_sp_log = [], []
-    x_real_log, y_real_log = [], []
-    vx_cmd_log, vy_cmd_log = [], []
-    error_x_log, error_y_log = [], []
+    log = {k: deque() for k in ('t', 'x_sp', 'y_sp', 'x', 'y',
+                                 'vx_real', 'vy_real', 'vx_des', 'vy_des',
+                                 'theta_real', 'err_r')}
 
-    print("🌀 Iniciando seguimiento de círculo en lazo cerrado...")
+    print(f"🌀 Path following: R={RADIUS} m, ω={ANGULAR_SPEED} rad/s, "
+          f"lookahead={math.degrees(LOOKAHEAD_ANGLE):.1f}°, "
+          f"duración≈{duration:.1f} s ({steps} pasos @ {RATE} Hz)")
+
+    next_t = time.monotonic()
+    x_sp = y_sp = yaw = 0.0   # inicializar para fase de cola
 
     for i in range(steps):
-        t = time.time() - t0
+        t_sched = i * dt
 
-        # 1. Calcular setpoint de posición circular
-        theta = omega * t
-        x_sp = center_x + radius * math.cos(theta)
-        y_sp = center_y + radius * math.sin(theta)
+        pos = get_latest_pos()
+        if pos is not None:
+            x_sp, y_sp, yaw, theta_real, err_r = compute_setpoint(
+                pos.x, pos.y, cx, cy, z0
+            )
+            send_position_yaw(master, x_sp, y_sp, z0, yaw)
 
-        # 2. Leer posición real actual (último mensaje disponible)
-        msg = master.recv_match(type='LOCAL_POSITION_NED', blocking=False)
-        if msg:
-            x_real = msg.x
-            y_real = msg.y
-        else:
-            # Si no hay mensaje nuevo, usar el último conocido (inicialmente 0)
-            # En la primera iteración podría no haber ninguno, entonces esperamos uno.
-            if i == 0:
-                msg = get_local_position(master)
-                x_real, y_real = msg.x, msg.y
+            # Velocidad tangencial deseada (para referencia en gráficas)
+            vx_des = -RADIUS * ANGULAR_SPEED * math.sin(theta_real + LOOKAHEAD_ANGLE)
+            vy_des =  RADIUS * ANGULAR_SPEED * math.cos(theta_real + LOOKAHEAD_ANGLE)
+
+            log['t'].append(t_sched)
+            log['x_sp'].append(x_sp)
+            log['y_sp'].append(y_sp)
+            log['x'].append(pos.x)
+            log['y'].append(pos.y)
+            log['vx_real'].append(pos.vx)
+            log['vy_real'].append(pos.vy)
+            log['vx_des'].append(vx_des)
+            log['vy_des'].append(vy_des)
+            log['theta_real'].append(theta_real)
+            log['err_r'].append(err_r)
+
+        next_t += dt
+        sleep_t = next_t - time.monotonic()
+        if sleep_t > 0:
+            time.sleep(sleep_t)
+
+    # ── Fase de cola: convergencia al punto final ────────────────────────────
+    x_final, y_final = x_sp, y_sp
+    t_offset     = steps * dt
+    t_tail_start = time.monotonic()
+    t_in_zone    = None
+
+    print(f"⏳ Esperando convergencia (radio={CONV_RADIUS} m, "
+          f"vel<{CONV_SPEED} m/s, hold={CONV_HOLD} s)...")
+
+    while True:
+        now = time.monotonic()
+        if now - t_tail_start > CONV_TIMEOUT:
+            print("⚠️  Timeout de convergencia — graficando con datos disponibles.")
+            break
+
+        pos = get_latest_pos()
+        if pos is not None:
+            dist  = math.hypot(pos.x - x_final, pos.y - y_final)
+            speed = math.hypot(pos.vx, pos.vy)
+            send_position_yaw(master, x_final, y_final, z0, yaw)
+
+            t_tail = t_offset + (now - t_tail_start)
+            log['t'].append(t_tail)
+            log['x_sp'].append(x_final)
+            log['y_sp'].append(y_final)
+            log['x'].append(pos.x)
+            log['y'].append(pos.y)
+            log['vx_real'].append(pos.vx)
+            log['vy_real'].append(pos.vy)
+            log['vx_des'].append(0.0)
+            log['vy_des'].append(0.0)
+            log['theta_real'].append(math.atan2(pos.y - cy, pos.x - cx))
+            log['err_r'].append(math.hypot(pos.x - cx, pos.y - cy) - RADIUS)
+
+            if dist < CONV_RADIUS and speed < CONV_SPEED:
+                if t_in_zone is None:
+                    t_in_zone = now
+                elif now - t_in_zone >= CONV_HOLD:
+                    print(f"✅ Convergencia: dist={dist:.3f} m, vel={speed:.3f} m/s")
+                    break
             else:
-                # Mantener el último valor conocido (puede causar error si se pierden muchos mensajes)
-                # Para simplificar, usamos el último guardado.
-                x_real = x_real_log[-1] if x_real_log else 0
-                y_real = y_real_log[-1] if y_real_log else 0
+                t_in_zone = None
 
-        # 3. Calcular error
-        ex = x_sp - x_real
-        ey = y_sp - y_real
-
-        # 4. Comando de velocidad proporcional
-        vx_cmd = kp * ex
-        vy_cmd = kp * ey
-
-        # 5. Enviar comando
-        send_velocity(master, vx_cmd, vy_cmd)
-
-        # 6. Guardar en logs
-        t_log.append(t)
-        x_sp_log.append(x_sp)
-        y_sp_log.append(y_sp)
-        x_real_log.append(x_real)
-        y_real_log.append(y_real)
-        vx_cmd_log.append(vx_cmd)
-        vy_cmd_log.append(vy_cmd)
-        error_x_log.append(ex)
-        error_y_log.append(ey)
-
-        # 7. Esperar para mantener la frecuencia
         time.sleep(dt)
 
-    # Detener el dron al finalizar
-    send_velocity(master, 0.0, 0.0)
-    print("⏹️ Completado. Dron detenido.")
+    print("⏹️  Registro completo.")
+    return {k: list(v) for k, v in log.items()}
 
-    return {
-        't': t_log,
-        'x_sp': x_sp_log, 'y_sp': y_sp_log,
-        'x_real': x_real_log, 'y_real': y_real_log,
-        'vx_cmd': vx_cmd_log, 'vy_cmd': vy_cmd_log,
-        'error_x': error_x_log, 'error_y': error_y_log
-    }
 
 # ===============================
-# FUNCIÓN DE GRAFICADO
+# GRÁFICAS
 # ===============================
-def plot_results(data, radius, omega, center_x, center_y):
-    """Genera gráficas de trayectoria, errores y velocidades de comando."""
-    t = data['t']
-    x_sp, y_sp = data['x_sp'], data['y_sp']
-    x_real, y_real = data['x_real'], data['y_real']
-    vx_cmd, vy_cmd = data['vx_cmd'], data['vy_cmd']
-    ex, ey = data['error_x'], data['error_y']
+def plot_results(log, x0, y0, cx, cy, duration):
+    t      = np.array(log['t'])
+    x_sp   = np.array(log['x_sp']);  y_sp = np.array(log['y_sp'])
+    x      = np.array(log['x']);     y    = np.array(log['y'])
+    vx_r   = np.array(log['vx_real']); vy_r = np.array(log['vy_real'])
+    vx_d   = np.array(log['vx_des']);  vy_d = np.array(log['vy_des'])
+    err_r  = np.array(log['err_r'])
+    mask   = t <= duration
 
-    # Círculo teórico completo para referencia
-    t_theory = np.linspace(0, max(t), 300)
-    x_theory = center_x + radius * np.cos(omega * t_theory)
-    y_theory = center_y + radius * np.sin(omega * t_theory)
+    err_pos = np.sqrt((x - x_sp)**2 + (y - y_sp)**2)
+    if mask.any():
+        print(f"📊 Error posición RMS (círculo): {np.mean(err_pos[mask]):.4f} m  "
+              f"|  máx: {np.max(err_pos[mask]):.4f} m")
+        print(f"📊 Error radial  RMS (círculo): {np.mean(np.abs(err_r[mask])):.4f} m  "
+              f"|  máx: {np.max(np.abs(err_r[mask])):.4f} m")
 
-    # Figura 1: Trayectoria en XY
-    plt.figure(figsize=(8, 8))
-    plt.plot(x_sp, y_sp, 'g--', linewidth=1, label='Setpoint (trayectoria deseada)')
-    plt.plot(x_real, y_real, 'b-', linewidth=1.5, label='Real (seguimiento)')
-    plt.plot(x_theory, y_theory, 'k:', linewidth=1, label='Círculo teórico')
-    plt.scatter(x_real[0], y_real[0], c='green', marker='o', label='Inicio')
-    plt.scatter(x_real[-1], y_real[-1], c='red', marker='x', label='Final')
-    plt.xlabel('X [m]')
-    plt.ylabel('Y [m]')
-    plt.axis('equal')
-    plt.legend()
-    plt.grid(True)
-    plt.title('Trayectoria en el plano XY (lazo cerrado)')
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f'Path following lazo cerrado — R={RADIUS} m, ω={ANGULAR_SPEED} rad/s, '
+                 f'lookahead={math.degrees(LOOKAHEAD_ANGLE):.1f}°', fontsize=12)
 
-    # Figura 2: Error de posición vs tiempo
-    plt.figure(figsize=(10, 4))
-    plt.plot(t, ex, 'r-', label='Error en X')
-    plt.plot(t, ey, 'b-', label='Error en Y')
-    plt.xlabel('Tiempo [s]')
-    plt.ylabel('Error [m]')
-    plt.legend()
-    plt.grid(True)
-    plt.title('Error de seguimiento')
+    # 1) Trayectoria XY
+    ax = axes[0, 0]
+    theta_th = np.linspace(0, 2 * math.pi, 400)
+    ax.plot(cx + RADIUS * np.cos(theta_th),
+            cy + RADIUS * np.sin(theta_th),
+            'g:', linewidth=1.2, label='Círculo teórico')
+    ax.plot(x_sp[mask], y_sp[mask], 'b--', linewidth=1.0,
+            label='Setpoints (lazo cerrado)', alpha=0.6)
+    ax.plot(x[mask],    y[mask],    'r-',  linewidth=2,   label='Real (círculo)')
+    ax.plot(x[~mask],   y[~mask],   color='orange', linewidth=1.5,
+            linestyle='--', label='Real (cola)')
+    ax.scatter(x0, y0, c='k', marker='o', zorder=5, label='Inicio')
+    ax.scatter(cx, cy, c='g', marker='+', s=80, zorder=5, label='Centro')
+    ax.set_xlabel('X [m]'); ax.set_ylabel('Y [m]')
+    ax.set_title('Trayectoria XY'); ax.axis('equal')
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.4)
 
-    # Figura 3: Comandos de velocidad enviados
-    plt.figure(figsize=(10, 4))
-    plt.plot(t, vx_cmd, 'r-', label='Vx cmd')
-    plt.plot(t, vy_cmd, 'b-', label='Vy cmd')
-    plt.xlabel('Tiempo [s]')
-    plt.ylabel('Velocidad comandada [m/s]')
-    plt.legend()
-    plt.grid(True)
-    plt.title('Comandos de velocidad (salida del controlador)')
+    # 2) Error radial en el tiempo
+    ax = axes[0, 1]
+    ax.plot(t[mask], err_r[mask], 'purple', linewidth=1.5)
+    ax.axhline(0, color='gray', linewidth=0.8, linestyle='--')
+    ax.axhline( CONV_RADIUS, color='orange', linewidth=0.8, linestyle=':')
+    ax.axhline(-CONV_RADIUS, color='orange', linewidth=0.8, linestyle=':')
+    ax.set_xlabel('Tiempo [s]'); ax.set_ylabel('Error radial [m]')
+    ax.set_title('Error radial (r_real − R)')
+    ax.grid(True, alpha=0.4)
 
+    # 3) Velocidad X
+    ax = axes[1, 0]
+    ax.axvline(duration, color='gray', linestyle=':', linewidth=1)
+    ax.plot(t, vx_d, 'b-',  linewidth=1.5, label='Vx deseada')
+    ax.plot(t, vx_r, 'r--', linewidth=1.2, label='Vx real', alpha=0.85)
+    ax.set_xlabel('Tiempo [s]'); ax.set_ylabel('Vx [m/s]')
+    ax.set_title('Velocidad en X'); ax.legend(); ax.grid(True, alpha=0.4)
+
+    # 4) Velocidad Y
+    ax = axes[1, 1]
+    ax.axvline(duration, color='gray', linestyle=':', linewidth=1)
+    ax.plot(t, vy_d, 'b-',  linewidth=1.5, label='Vy deseada')
+    ax.plot(t, vy_r, 'r--', linewidth=1.2, label='Vy real', alpha=0.85)
+    ax.set_xlabel('Tiempo [s]'); ax.set_ylabel('Vy [m/s]')
+    ax.set_title('Velocidad en Y'); ax.legend(); ax.grid(True, alpha=0.4)
+
+    plt.tight_layout()
     plt.show()
+
 
 # ===============================
 # PROGRAMA PRINCIPAL
 # ===============================
 if __name__ == '__main__':
-    # Conexión
-    print(f"🔌 Conectando a {CONN}...")
     master = mavutil.mavlink_connection(CONN)
-    wait_heartbeat(master)
+    master.wait_heartbeat()
+    print(f"🔗 Conectado: SYS={master.target_system} COMP={master.target_component}")
+    print("Asegúrate de que el dron esté en GUIDED, armado y en hover.")
+    input("Presiona Enter para comenzar el círculo...")
 
-    # Opcional: asegurarse de que estamos en GUIDED (ya se asume, pero se podría cambiar)
-    # Podríamos cambiar el modo a GUIDED si no lo está (requiere más lógica)
-
-    # Obtener posición inicial
-    print("📍 Obteniendo posición inicial...")
-    pos0 = get_local_position(master)
-    x0, y0, z0 = pos0.x, pos0.y, pos0.z
-    print(f"Posición inicial: x={x0:.2f}, y={y0:.2f}, z={z0:.2f} (NED: z negativo arriba)")
-
-    # Centro del círculo (en este ejemplo, lo centramos en la posición inicial)
-    center_x, center_y = x0, y0
-
-    # Altitud deseada (usamos la inicial, asumiendo que ya está a la altura de vuelo)
-    # Si no, podríamos hacer un takeoff a una altitud específica.
-    target_z = z0  # Mantener la misma altitud
-
-    # Armar y despegar si es necesario (si no está en el aire)
-    # Comprobamos si z es cercano a 0 (en NED, z negativo arriba, 0 es suelo)
-    if abs(z0) < 0.5:  # Si está cerca del suelo, despegamos
-        arm_and_takeoff(master, 2.0)  # Despegue a 2 metros (positivo en altitud, pero en NED es -2)
-        # Después del takeoff, actualizamos la posición inicial para el centro
-        pos0 = get_local_position(master)
-        center_x, center_y = pos0.x, pos0.y
-        target_z = pos0.z
-    else:
-        print("El dron ya está en el aire, omitiendo takeoff.")
-
-    # Ejecutar control en lazo cerrado
-    data = closed_loop_circle(
-        master=master,
-        center_x=center_x,
-        center_y=center_y,
-        z=target_z,
-        radius=RADIUS,
-        omega=ANGULAR_SPEED,
-        duration=DURATION,
-        kp=KP,
-        dt=DT
+    stop_reader   = threading.Event()
+    reader_thread = threading.Thread(
+        target=_mavlink_reader,
+        args=(master, stop_reader),
+        daemon=True,
+        name="mavlink-reader"
     )
+    reader_thread.start()
 
-    # Cerrar conexión
+    pos0 = wait_position_ready()
+    x0, y0, z0 = pos0.x, pos0.y, pos0.z
+    print(f"📍 Posición inicial: x={x0:.2f}, y={y0:.2f}, z={z0:.2f}")
+
+    # Centro del círculo: el dron parte desde el borde izquierdo
+    cx = x0 + RADIUS
+    cy = y0
+
+    print(f"⚙️  Centro del círculo: cx={cx:.2f}, cy={cy:.2f}")
+    print(f"⚙️  Lookahead: {math.degrees(LOOKAHEAD_ANGLE):.1f}° | K_radial: {K_RADIAL}")
+
+    duration = 2 * math.pi / ANGULAR_SPEED
+
+    log = fly_circle_closed_loop(master, cx, cy, z0, duration)
+
+    stop_reader.set()
+    reader_thread.join(timeout=2.0)
     master.close()
-    print("🔌 Conexión cerrada.")
 
-    # Graficar resultados
-    plot_results(data, RADIUS, ANGULAR_SPEED, center_x, center_y)
+    plot_results(log, x0, y0, cx, cy, duration)

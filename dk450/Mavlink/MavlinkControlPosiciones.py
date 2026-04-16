@@ -8,11 +8,11 @@ import matplotlib.pyplot as plt
 # CONFIGURACIÓN
 # ===============================
 CONN = 'udp:127.0.0.1:14552'
-SYSID = 2
+SYSID = 1
 COMPID = 0
 
 RATE =25
-RADIUS = 2.0
+RADIUS = 4.0
 ANGULAR_SPEED = 0.4
 
 # ===============================
