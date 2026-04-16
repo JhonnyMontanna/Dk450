@@ -29,6 +29,10 @@ setup(
             'Mavros_Land = dk450.Mavros_Land:main',
             'ControlPID_Seguidor = dk450.ControlPID_Seguidor:main',
             'ControlP_Seguidor = dk450.ControlP_Seguidor:main',
+            'Mavros_CirculoA = dk450.Mavros_CirculoA:main',
+            'Mavros_Lemniscata = dk450.Mavros_Lemniscata:main',
+            'Mavros_Cuadrado = dk450.Mavros_Cuadrado:main',
+            'Mavros_ControlLF = dk450.Mavros_ControlLF:main',
         ],
     },
 )
