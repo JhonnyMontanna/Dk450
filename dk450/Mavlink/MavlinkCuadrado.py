@@ -38,7 +38,7 @@ WAYPOINTS = [
 ADVANCE_MODE      = 'convergence'  # 'convergence' | 'timer'
 
 # Parámetros modo timer
-WAYPOINT_INTERVAL = 5.0    # segundos por waypoint (solo en modo 'timer')
+WAYPOINT_INTERVAL = 10.0    # segundos por waypoint (solo en modo 'timer')
 
 # Parámetros de convergencia (solo en modo 'convergence')
 CONV_RADIUS  = 0.30   # distancia máxima para considerar "llegó" [m]
