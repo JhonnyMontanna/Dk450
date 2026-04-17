@@ -130,17 +130,17 @@ class LemniscateNode(Node):
 
         self.create_subscription(
             PoseStamped,
-            f'/{ns}/mavros/local_position/pose',
+            f'/{ns}/local_position/pose',
             self._cb_pose, _STATE_QOS
         )
         self.create_subscription(
             TwistStamped,
-            f'/{ns}/mavros/local_position/velocity_local',
+            f'/{ns}/local_position/velocity_local',
             self._cb_vel, _STATE_QOS
         )
         self._pub = self.create_publisher(
             PoseStamped,
-            f'/{ns}/mavros/setpoint_position/local',
+            f'/{ns}/setpoint_position/local',
             _MAVROS_QOS
         )
 

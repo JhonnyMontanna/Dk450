@@ -139,31 +139,31 @@ class LeaderFollowerNode(Node):
         # ── Suscripciones líder ───────────────────────────────────────────────
         self.create_subscription(
             PoseStamped,
-            f'/{L_ns}/mavros/local_position/pose',
+            f'/{L_ns}/local_position/pose',
             self._cb_lpose, _STATE_QOS
         )
         self.create_subscription(
             TwistStamped,
-            f'/{L_ns}/mavros/local_position/velocity_local',
+            f'/{L_ns}/local_position/velocity_local',
             self._cb_lvel, _STATE_QOS
         )
 
         # ── Suscripciones seguidor ────────────────────────────────────────────
         self.create_subscription(
             PoseStamped,
-            f'/{F_ns}/mavros/local_position/pose',
+            f'/{F_ns}/local_position/pose',
             self._cb_spose, _STATE_QOS
         )
         self.create_subscription(
             TwistStamped,
-            f'/{F_ns}/mavros/local_position/velocity_local',
+            f'/{F_ns}/local_position/velocity_local',
             self._cb_svel, _STATE_QOS
         )
 
         # ── Publicador ────────────────────────────────────────────────────────
         self._pub = self.create_publisher(
             TwistStamped,
-            f'/{F_ns}/mavros/setpoint_velocity/cmd_vel',
+            f'/{F_ns}/setpoint_velocity/cmd_vel',
             _MAVROS_QOS
         )
 
