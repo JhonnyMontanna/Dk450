@@ -159,16 +159,16 @@ class MasterNode(Node):
 
         # ── Clientes de servicio MAVROS ───────────────────────────────────────
         self._arm_cli  = self.create_client(
-            CommandBool, f'/{self.ns}/cmd/arming'
+            CommandBool, f'/{self.ns}/mavros/cmd/arming'
         )
         self._mode_cli = self.create_client(
-            SetMode, f'/{self.ns}/set_mode'
+            SetMode, f'/{self.ns}/mavros/set_mode'
         )
         self._tol_cli  = self.create_client(
-            CommandTOL, f'/{self.ns}/cmd/takeoff'
+            CommandTOL, f'/{self.ns}/mavros/cmd/takeoff'
         )
         self._land_cli = self.create_client(
-            CommandTOL, f'/{self.ns}/cmd/land'
+            CommandTOL, f'/{self.ns}/mavros/cmd/land'
         )
 
         # ── Hilo de la terminal (interfaz de usuario) ─────────────────────────
@@ -478,56 +478,69 @@ class MasterNode(Node):
             self._state = State_.IDLE
             return
 
-        x0, y0, _ = pos
+        x0, y0, z0 = pos
+        # La altitud del cuadrado es RELATIVA a la posición actual del dron
+        # Si altitude=3.0 y el dron ya está a z0=5.0, el cuadrado vuela a z0+3=8 ✗
+        # Por eso usamos z0 directamente y altitude como offset opcional
+        tz = z0 if altitude == 0.0 else altitude
         wps = [
-            (x0,        y0,        altitude),
-            (x0 + side, y0,        altitude),
-            (x0 + side, y0 + side, altitude),
-            (x0,        y0 + side, altitude),
-            (x0,        y0,        altitude),
+            (x0,        y0,        tz),
+            (x0 + side, y0,        tz),
+            (x0 + side, y0 + side, tz),
+            (x0,        y0 + side, tz),
+            (x0,        y0,        tz),
         ]
 
         self.get_logger().info(
-            f'Cuadrado: lado={side}m alt={altitude}m '
-            f'({len(wps)} waypoints)'
+            f'Cuadrado: lado={side}m z={tz:.2f}m '
+            f'({len(wps)} waypoints) conv_r={conv_r}m conv_v={conv_v}m/s'
         )
 
-        for idx, (tx, ty, tz) in enumerate(wps):
+        for idx, (tx, ty, tz_wp) in enumerate(wps):
             if self._stop_mode.is_set():
                 break
             self.get_logger().info(
-                f'  WP{idx+1}/{len(wps)}: ({tx:.1f},{ty:.1f},{tz:.1f})'
+                f'  WP{idx+1}/{len(wps)}: ({tx:.1f},{ty:.1f},{tz_wp:.1f})'
             )
-            zone_t = None
-            next_t = time.monotonic()
+            zone_t        = None
+            next_t        = time.monotonic()
             timeout_start = time.monotonic()
 
             while not self._stop_mode.is_set():
-                if time.monotonic() - timeout_start > 30.0:
+                now = time.monotonic()
+                if now - timeout_start > 30.0:
                     self.get_logger().warn(f'  WP{idx+1} timeout — avanzando')
                     break
 
-                self._pub_pos.publish(_make_pose(self, tx, ty, tz, 0.0))
+                self._pub_pos.publish(_make_pose(self, tx, ty, tz_wp, 0.0))
                 pos, vel, _ = self._get_pos()
 
-                if pos:
+                if pos is not None:
                     x, y, z = pos
-                    vx, vy, vz = vel or (0, 0, 0)
-                    dist  = math.sqrt((x-tx)**2 + (y-ty)**2 + (z-tz)**2)
-                    speed = math.sqrt(vx**2 + vy**2 + vz**2)
+                    if vel is not None:
+                        vx, vy, vz = vel
+                        speed = math.sqrt(vx**2 + vy**2 + vz**2)
+                    else:
+                        speed = float('inf')   # sin vel → no convergemos aún
+
+                    dist = math.sqrt((x-tx)**2 + (y-ty)**2 + (z-tz_wp)**2)
+                    self.get_logger().debug(
+                        f'  WP{idx+1} dist={dist:.3f}m speed={speed:.3f}m/s'
+                    )
 
                     if dist < conv_r and speed < conv_v:
-                        zone_t = zone_t or time.monotonic()
-                        if time.monotonic() - zone_t >= 1.0:
+                        zone_t = zone_t or now
+                        if now - zone_t >= 1.0:
                             self.get_logger().info(
-                                f'  WP{idx+1} OK dist={dist:.3f}m'
+                                f'  WP{idx+1} OK en {now-timeout_start:.1f}s '
+                                f'dist={dist:.3f}m speed={speed:.3f}m/s'
                             )
                             break
                     else:
                         zone_t = None
 
                 next_t += self.dt
-                s = next_t - time.monotonic()
+                s = next_t - now
                 if s > 0:
                     time.sleep(s)
 
@@ -723,7 +736,7 @@ class MasterNode(Node):
         elif cmd == 'square':
             # square [side] [altitude] [conv_r] [conv_v]
             side = float(args[0]) if len(args) > 0 else 5.0
-            alt  = float(args[1]) if len(args) > 1 else 3.0
+            alt  = float(args[1]) if len(args) > 1 else 0.0
             cr   = float(args[2]) if len(args) > 2 else 0.30
             cv   = float(args[3]) if len(args) > 3 else 0.15
             print(f'  Cuadrado: lado={side}m alt={alt}m')
@@ -775,8 +788,9 @@ class MasterNode(Node):
 ║  lemniscate [a=4] [b=2] [ω=0.3] [modo=center]              ║
 ║    a=semieje X(m)  b=semieje Y(m)  modo=center|tip          ║
 ║                                                              ║
-║  square [lado=5] [alt=3] [cr=0.3] [cv=0.15]                ║
-║    lado(m)  alt=altitud(m)  cr=radio conv  cv=vel conv      ║
+║  square [lado=5] [alt=0] [cr=0.3] [cv=0.15]                ║
+║    lado(m)  alt=z absoluto (0=usar z actual)                ║
+║             cr=radio conv  cv=vel conv                      ║
 ║                                                              ║
 ║  follow <lider_ns> [d=2] [α°=180] [Δz=0]                   ║
 ║         [Kp=0.5] [Ki=0.05] [Kd=0.2] [Kp_ψ=0.8] [Kd_ψ=0.1]║
