@@ -27,11 +27,11 @@ COMPID = 0
 # x = norte [m], y = este [m], z = abajo [m] (negativo = altitud)
 # El primer punto suele ser la posición de inicio (o cerca de ella)
 WAYPOINTS = [
-    ( 0.0,  0.0, -3.0),   # punto inicial / hover
-    ( 5.0,  0.0, -3.0),   # norte 5 m
-    ( 5.0,  5.0, -3.0),   # este  5 m
-    ( 0.0,  5.0, -3.0),   # sur   5 m
-    ( 0.0,  0.0, -3.0),   # regreso al origen
+    ( 0.0,  0.0, -2.0),   # punto inicial / hover
+    ( 5.0,  0.0, -2.0),   # norte 5 m
+    ( 5.0,  5.0, -2.0),   # este  5 m
+    ( 0.0,  5.0, -2.0),   # sur   5 m
+    ( 0.0,  0.0, -2.0),   # regreso al origen
 ]
 
 # Modo de avance entre waypoints
