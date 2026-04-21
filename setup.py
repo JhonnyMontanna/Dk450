@@ -32,7 +32,10 @@ setup(
             'Mavros_CirculoA = dk450.Mavros_CirculoA:main',
             'Mavros_Lemniscata = dk450.Mavros_Lemniscata:main',
             'Mavros_Cuadrado = dk450.Mavros_Cuadrado:main',
-            'Mavros_ControlLF = dk450.Mavros_ControlLF:main',
+            'Mavros_ControlLF = dk450.Mavros_ControlLF:main', 
+            'Mavros_Graficas = dk450.Mavros_Graficas:main',
+            'Mavros_Master = dk450.Mavros_Master:main',
+
         ],
     },
 )
