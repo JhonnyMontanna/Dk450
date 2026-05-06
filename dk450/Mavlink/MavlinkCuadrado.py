@@ -27,15 +27,15 @@ COMPID = 0
 # x = norte [m], y = este [m], z = abajo [m] (negativo = altitud)
 # El primer punto suele ser la posición de inicio (o cerca de ella)
 WAYPOINTS = [
-    ( 0.0,  0.0, -2.0),   # punto inicial / hover
-    ( 5.0,  0.0, -2.0),   # norte 5 m
-    ( 5.0,  5.0, -2.0),   # este  5 m
-    ( 0.0,  5.0, -2.0),   # sur   5 m
-    ( 0.0,  0.0, -2.0),   # regreso al origen
+    ( 0.0,  0.0, -4.0),   # punto inicial / hover
+    ( 5.0,  0.0, -4.0),   # norte 5 m
+    ( 5.0,  5.0, -4.0),   # este  5 m
+    ( 0.0,  5.0, -4.0),   # sur   5 m
+    ( 0.0,  0.0, -4.0),   # regreso al origen
 ]
 
 # Modo de avance entre waypoints
-ADVANCE_MODE      = 'convergence'  # 'convergence' | 'timer'
+ADVANCE_MODE      = 'timer'  # 'convergence' | 'timer'
 
 # Parámetros modo timer
 WAYPOINT_INTERVAL = 10.0    # segundos por waypoint (solo en modo 'timer')
@@ -208,19 +208,26 @@ def run_waypoints(master):
 # ===============================
 def plot_results(log, wps):
     t     = np.array(log['t'])
-    x, y, z_   = np.array(log['x']), np.array(log['y']), np.array(log['z'])
-    xsp   = np.array(log['x_sp'])
-    ysp   = np.array(log['y_sp'])
-    zsp   = np.array(log['z_sp'])
+    x, y, z_ned   = np.array(log['x']), np.array(log['y']), np.array(log['z'])
+    xsp, ysp, zsp_ned = np.array(log['x_sp']), np.array(log['y_sp']), np.array(log['z_sp'])
     idx   = np.array(log['wp_idx'])
-    err   = np.sqrt((x-xsp)**2 + (y-ysp)**2 + (z_-zsp)**2)
+    
+    # Convertir de NED a ENU para graficación (solo Z cambia de signo)
+    z_enu = -z_ned
+    zsp_enu = -zsp_ned
+    
+    # El error 3D se calcula con los valores originales NED (no cambia)
+    err = np.sqrt((x-xsp)**2 + (y-ysp)**2 + (z_ned-zsp_ned)**2)
+    
+    # Convertir waypoints para graficación
+    wps_enu = [(wx, wy, -wz) for wx, wy, wz in wps]
 
     print(f"\nError posición RMS total: {err.mean():.4f} m  |  máx: {err.max():.4f} m")
 
     colors = plt.cm.tab10(np.linspace(0, 1, len(wps)))
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 8))
-    fig.suptitle('Seguimiento de waypoints NED', fontsize=13)
+    fig.suptitle('Seguimiento de waypoints ENU', fontsize=13)  # Título cambiado
 
     # — Error en el tiempo con banda por waypoint —
     ax = axes[0, 0]
@@ -241,22 +248,22 @@ def plot_results(log, wps):
     ax.set(xlabel='Tiempo [s]', ylabel='Posición [m]', title='X e Y vs tiempo')
     ax.legend(fontsize=8); ax.grid(True, alpha=0.4)
 
-    # — Altitud en el tiempo —
+    # — Altitud ENU (positiva hacia arriba) —
     ax = axes[1, 0]
-    ax.plot(t, zsp, 'g--', lw=1, label='Z_sp (NED)', alpha=0.7)
-    ax.plot(t, z_,  'g-',  lw=1.5, label='Z real')
-    ax.set(xlabel='Tiempo [s]', ylabel='Z NED [m]', title='Altitud (Z NED)')
+    ax.plot(t, zsp_enu, 'g--', lw=1, label='Z_sp (ENU)', alpha=0.7)
+    ax.plot(t, z_enu,  'g-',  lw=1.5, label='Z real (ENU)')
+    ax.set(xlabel='Tiempo [s]', ylabel='Altitud [m]', title='Altitud (ENU)')
     ax.legend(fontsize=8); ax.grid(True, alpha=0.4)
 
-    # — Trayectoria XY top-down —
+    # — Trayectoria XY top-down (sin cambios, XY no se modifica) —
     ax = axes[1, 1]
     ax.plot(xsp, ysp, 'k:', lw=1.2, label='Ruta programada', zorder=1)
-    for i in range(len(wps)):
+    for i in range(len(wps_enu)):
         m = idx == i
         if m.sum():
             ax.plot(x[m], y[m], '-', color=colors[i], lw=2, label=f'WP{i+1}')
-    # Marcar cada waypoint
-    for i, (wx, wy, _) in enumerate(wps):
+    # Marcar cada waypoint (usando wps_enu pero solo XY)
+    for i, (wx, wy, _) in enumerate(wps_enu):
         ax.scatter(wx, wy, color=colors[i], s=60, zorder=5, edgecolors='k', lw=0.5)
         ax.annotate(f'{i+1}', (wx, wy), textcoords='offset points',
                     xytext=(6, 4), fontsize=8)

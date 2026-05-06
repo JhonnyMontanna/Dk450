@@ -23,8 +23,8 @@ import numpy as np
 CONN          = 'udp:127.0.0.1:14552'
 SYSID         = 1
 COMPID        = 0
-RADIUS        = 6.0     # metros
-ANGULAR_SPEED = 0.4     # rad/s
+RADIUS        = 8.0     # metros
+ANGULAR_SPEED = 0.2     # rad/s
 RATE          = 50      # Hz
 
 # Criterio de convergencia al punto final (fase de "cola")

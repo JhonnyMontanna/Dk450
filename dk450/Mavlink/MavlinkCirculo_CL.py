@@ -51,7 +51,7 @@ RATE          = 20      # Hz
 #   Alto → corrección agresiva, puede oscilar.
 #   Bajo → el radio converge lentamente.
 #   Rango típico: 0.3 – 1.0
-KP_R  = 0.6
+KP_R  = 5.6
 
 # KP_PH: ganancia de fase (tangencial). Corrige adelanto/retraso angular.
 #   Alto → responde rápido a atrasos, puede sobrepasar.

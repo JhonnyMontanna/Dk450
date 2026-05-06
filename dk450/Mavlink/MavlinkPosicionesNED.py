@@ -17,7 +17,7 @@ master.mav.set_position_target_local_ned_send(
     master.target_component,
     mavutil.mavlink.MAV_FRAME_LOCAL_NED,
     0b0000111111111000,                 # type_mask: usar sólo x,y,z
-    -1.0, -1.0, -2.0,                      # x=5 m, y=2 m, z=0 m
+    -4.0, -0.0, -3.0,                      # x=5 m, y=2 m, z=0 m
     0, 0, 0,                            # vx, vy, vz ignorados
     0, 0, 0,                            # ax, ay, az ignorados
     0, 0                                # yaw, yaw_rate ignorados

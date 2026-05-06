@@ -27,7 +27,7 @@ CONN          = 'udp:127.0.0.1:14552'
 SYSID         = 1
 COMPID        = 0
 
-AXIS_A        = 5.0    # semieje X — ancho de cada lóbulo [m]
+AXIS_A        = 8.0    # semieje X — ancho de cada lóbulo [m]
 AXIS_B        = 7.0    # semieje Y — alto de cada lóbulo [m]
 ANGULAR_SPEED = 0.5    # ω [rad/s]
 RATE          = 50     # Hz
