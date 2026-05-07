@@ -209,7 +209,7 @@ def fly_and_record(master, duration):
         theta  = theta0 + ANGULAR_SPEED * t_sched
         x_sp   = cx + RADIUS * math.cos(theta)
         y_sp   = cy + RADIUS * math.sin(theta)
-        yaw    = theta + math.pi / 2
+        yaw    = theta #+ math.pi / 2
         send_position_yaw(master, x_sp, y_sp, z0_ned, yaw)
 
         vx_des = -RADIUS * ANGULAR_SPEED * math.sin(theta)

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 MavlinkControlLFLog.py — Controlador líder-seguidor con líder virtual desde CSV
-Versión con flechas estilo MATLAB y leyendas optimizadas
+Versión con control INDEPENDIENTE de inversión para:
+  - Trayectorias (coordenadas)
+  - Frame RTK (centro)
+  - Frames de drones
 """
 
 import math
@@ -35,23 +38,36 @@ RATE, DT = 20, 0.05
 SPEED_FACTOR = 1.0
 
 # ── Archivos ──────────────────────────────────────────────────────────────────
-LEADER_CSV = 'circulo_log_1778128773.csv'
+LEADER_CSV = 'circulo_log_SITL1.csv'
 
 # ── Pre-posicionamiento ───────────────────────────────────────────────────────
 PRE_POSITION = True
 PRE_CONV_RADIUS, PRE_CONV_Z, PRE_CONV_SPEED = 0.20, 0.15, 0.10
 PRE_CONV_HOLD, PRE_CONV_TIMEOUT, PRE_RATE = 1.5, 30.0, 10
 
-# ── Configuración de inversión de ejes ────────────────────────────────────────
-INVERTIR_EJE_X = True
-INVERTIR_EJE_Y = True
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN DE INVERSIÓN - TRES CONTROLES INDEPENDIENTES
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── Parámetros de visualización estilo MATLAB ─────────────────────────────────
-SC_DRONE = 0.50      # longitud de los ejes del drone (igual que MATLAB)
-SC_RTK   = SC_DRONE * 2.0   # longitud del frame RTK (más grande)
-FW_ARROW = 1.2       # linewidth flechas de drones (más delgado)
+# 1. Inversión de TRAYECTORIAS (coordenadas x, y)
+INVERTIR_TRAYECTORIA_X = True   # True = invertir eje X de las trayectorias
+INVERTIR_TRAYECTORIA_Y = True   # True = invertir eje Y de las trayectorias
+
+# 2. Inversión del FRAME RTK (sistema de coordenadas en el centro)
+INVERTIR_RTK_X = False   # True = invertir eje X del frame RTK
+INVERTIR_RTK_Y = False   # True = invertir eje Y del frame RTK
+
+# 3. Inversión de los FRAMES DE LOS DRONES (flechas roja/verde)
+INVERTIR_DRONE_X = True   # True = invertir eje X del frame del drone
+INVERTIR_DRONE_Y = True   # True = invertir eje Y del frame del drone
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Parámetros de visualización estilo MATLAB
+# ──────────────────────────────────────────────────────────────────────────────
+SC_DRONE = 0.50      # longitud de los ejes del drone
+SC_RTK   = SC_DRONE * 2.0   # longitud del frame RTK
+FW_ARROW = 1.2       # linewidth flechas de drones
 FW_RTK   = FW_ARROW + 0.6   # linewidth flechas RTK
-HEAD_SIZE = 0.30     # tamaño de cabeza de flecha (MATLAB usa 0.30-0.55)
 
 # ── CSV de salida ─────────────────────────────────────────────────────────────
 CSV_HEADER = [
@@ -250,7 +266,7 @@ def goto_initial_position(master, leader_data: list):
         time.sleep(dt_pre)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FUNCIONES DE VISUALIZACIÓN (ESTILO MATLAB)
+# FUNCIONES DE VISUALIZACIÓN (CON CONTROLES INDEPENDIENTES)
 # ──────────────────────────────────────────────────────────────────────────────
 C_refL = np.array([0.40, 0.65, 1.00])
 C_refS = np.array([1.00, 0.60, 0.40])
@@ -262,41 +278,58 @@ LW, LWS = 2.0, 1.2
 
 def _wrap_np(arr): return np.arctan2(np.sin(arr), np.cos(arr))
 
-def transform_for_mirror(x, y):
-    x_factor = -1 if INVERTIR_EJE_X else 1
-    y_factor = -1 if INVERTIR_EJE_Y else 1
+def transform_trayectoria(x, y):
+    """Solo invierte las TRAYECTORIAS (coordenadas)"""
+    x_factor = -1 if INVERTIR_TRAYECTORIA_X else 1
+    y_factor = -1 if INVERTIR_TRAYECTORIA_Y else 1
     return x * x_factor, y * y_factor
 
 def draw_drone_frame(ax, x, y, yaw, scale=SC_DRONE, lw=FW_ARROW):
-    """Dibuja los ejes del drone estilo MATLAB (cabezas pequeñas)"""
+    """
+    Dibuja los ejes del drone.
+    La inversión se aplica SOLO a las flechas, no a las coordenadas (ya transformadas)
+    """
+    # Factores de inversión para las FLECHAS del drone
+    x_factor = -1 if INVERTIR_DRONE_X else 1
+    y_factor = -1 if INVERTIR_DRONE_Y else 1
+    
     # Eje X̂ (frente) - Rojo
-    ax.quiver(x, y, scale*np.cos(yaw), scale*np.sin(yaw), 
+    ax.quiver(x, y, x_factor * scale * np.cos(yaw), y_factor * scale * np.sin(yaw), 
               angles='xy', scale_units='xy', scale=1,
               color=[0.85, 0.10, 0.10], width=0.006,
               headwidth=4, headlength=3.5, headaxislength=3, alpha=0.9)
     # Eje Ŷ (lateral) - Verde
-    ax.quiver(x, y, scale*np.cos(yaw+np.pi/2), scale*np.sin(yaw+np.pi/2),
+    ax.quiver(x, y, x_factor * scale * np.cos(yaw + np.pi/2), 
+              y_factor * scale * np.sin(yaw + np.pi/2),
               angles='xy', scale_units='xy', scale=1,
               color=[0.10, 0.65, 0.10], width=0.006,
               headwidth=4, headlength=3.5, headaxislength=3, alpha=0.9)
 
 def draw_rtk_frame(ax):
-    """Dibuja el sistema de coordenadas RTK en el origen (estilo MATLAB)"""
+    """Dibuja el frame RTK con inversión INDEPENDIENTE (solo las flechas)"""
+    # Factores de inversión para las FLECHAS del RTK
+    x_factor = -1 if INVERTIR_RTK_X else 1
+    y_factor = -1 if INVERTIR_RTK_Y else 1
+    
     # Eje X̂_RTK - Rojo
-    ax.quiver(0, 0, SC_RTK, 0, angles='xy', scale_units='xy', scale=1,
+    ax.quiver(0, 0, SC_RTK * x_factor, 0, angles='xy', scale_units='xy', scale=1,
               color=[0.85, 0.10, 0.10], width=0.008,
               headwidth=4, headlength=4, headaxislength=3.5, alpha=0.9)
     # Eje Ŷ_RTK - Verde
-    ax.quiver(0, 0, 0, SC_RTK, angles='xy', scale_units='xy', scale=1,
+    ax.quiver(0, 0, 0, SC_RTK * y_factor, angles='xy', scale_units='xy', scale=1,
               color=[0.10, 0.65, 0.10], width=0.008,
               headwidth=4, headlength=4, headaxislength=3.5, alpha=0.9)
     # Origen
     ax.plot(0, 0, 'ok', ms=6, mfc='k', mec='k')
-    # Etiquetas (ubicadas para no interferir con las flechas)
-    ax.text(SC_RTK+0.12, -0.08, r'$\hat{x}_{RTK}$', fontsize=11, 
-            fontweight='bold', ha='left', va='top')
-    ax.text(-0.08, SC_RTK+0.12, r'$\hat{y}_{RTK}$', fontsize=11, 
-            fontweight='bold', ha='right', va='bottom')
+    
+    # Etiquetas (se posicionan según la dirección de las flechas)
+    x_label_pos = SC_RTK * x_factor + (0.12 if x_factor > 0 else -0.35)
+    y_label_pos = SC_RTK * y_factor + (0.12 if y_factor > 0 else -0.35)
+    
+    ax.text(x_label_pos, -0.08 if x_factor > 0 else 0.05, r'$\hat{x}_{RTK}$', fontsize=11, 
+            fontweight='bold', ha='left' if x_factor > 0 else 'right', va='top')
+    ax.text(-0.08 if y_factor > 0 else 0.05, y_label_pos, r'$\hat{y}_{RTK}$', fontsize=11, 
+            fontweight='bold', ha='right' if y_factor > 0 else 'left', va='bottom' if y_factor > 0 else 'top')
 
 def plot_results(buf):
     """Genera las 7 figuras estilo MATLAB"""
@@ -332,14 +365,21 @@ def plot_results(buf):
     print(f'Error formación RMS:    {rms(dist - OFFSET_D):.4f} m')
     print('====================================\n')
     
+    # Mostrar configuración actual
+    print('Configuración de inversión:')
+    print(f'  Trayectorias: X={INVERTIR_TRAYECTORIA_X}, Y={INVERTIR_TRAYECTORIA_Y}')
+    print(f'  Frame RTK:    X={INVERTIR_RTK_X}, Y={INVERTIR_RTK_Y}')
+    print(f'  Frames drones: X={INVERTIR_DRONE_X}, Y={INVERTIR_DRONE_Y}')
+    print('====================================\n')
+    
     # ==================== FIGURA 1 - Trayectoria XY completa ====================
     fig1, ax = plt.subplots(figsize=(8, 8), facecolor='white')
     
-    # Transformar coordenadas
-    xdesL_t, ydesL_t = transform_for_mirror(xdesL, ydesL)
-    xdesS_t, ydesS_t = transform_for_mirror(xdesS, ydesS)
-    xL_t, yL_t = transform_for_mirror(xL, yL)
-    xS_t, yS_t = transform_for_mirror(xS, yS)
+    # Transformar coordenadas de TRAYECTORIAS
+    xdesL_t, ydesL_t = transform_trayectoria(xdesL, ydesL)
+    xdesS_t, ydesS_t = transform_trayectoria(xdesS, ydesS)
+    xL_t, yL_t = transform_trayectoria(xL, yL)
+    xS_t, yS_t = transform_trayectoria(xS, yS)
     
     # Setpoints y trayectorias
     ax.plot(xdesL_t, ydesL_t, '--', color=C_refL, lw=LWS, label='Setpoint Líder', alpha=0.7)
@@ -348,36 +388,35 @@ def plot_results(buf):
     ax.plot(xS_t, yS_t, '-', color=C_S, lw=LW, label='Seguidor real')
     
     # Puntos de inicio
-    xL0, yL0 = transform_for_mirror(np.array([xL[0]]), np.array([yL[0]]))
-    xS0, yS0 = transform_for_mirror(np.array([xS[0]]), np.array([yS[0]]))
+    xL0, yL0 = transform_trayectoria(np.array([xL[0]]), np.array([yL[0]]))
+    xS0, yS0 = transform_trayectoria(np.array([xS[0]]), np.array([yS[0]]))
     ax.plot(xL0[0], yL0[0], 'o', ms=9, mfc=C_L, mec='k', mew=1.2, label='Inicio Líder')
     ax.plot(xS0[0], yS0[0], 's', ms=8, mfc=C_S, mec='k', mew=1.2, label='Inicio Seguidor')
     
-    # Vectores d estilo MATLAB (con cabezas pequeñas)
+    # Vectores d
     n_d = 24
     idxd = np.round(np.linspace(0, n-1, n_d+2)).astype(int)[1:-1]
     for i in idxd:
-        xi, yi = transform_for_mirror(np.array([xL[i]]), np.array([yL[i]]))
-        xj, yj = transform_for_mirror(np.array([xS[i]]), np.array([yS[i]]))
+        xi, yi = transform_trayectoria(np.array([xL[i]]), np.array([yL[i]]))
+        xj, yj = transform_trayectoria(np.array([xS[i]]), np.array([yS[i]]))
         ax.quiver(xi[0], yi[0], xj[0]-xi[0], yj[0]-yi[0],
                   angles='xy', scale_units='xy', scale=1,
                   color=C_form, width=0.003, headwidth=3.5,
                   headlength=3.5, headaxislength=3, alpha=0.7)
     
-    # Frames de los drones (6 instantes)
+    # Frames de los drones (con sus propias reglas de inversión)
     n_frames = 6
     idx_frames = np.round(np.linspace(0, n-1, n_frames)).astype(int)
     for idx in idx_frames:
-        xLk, yLk = transform_for_mirror(np.array([xL[idx]]), np.array([yL[idx]]))
-        xSk, ySk = transform_for_mirror(np.array([xS[idx]]), np.array([yS[idx]]))
+        xLk, yLk = transform_trayectoria(np.array([xL[idx]]), np.array([yL[idx]]))
+        xSk, ySk = transform_trayectoria(np.array([xS[idx]]), np.array([yS[idx]]))
         draw_drone_frame(ax, xLk[0], yLk[0], psiL[idx])
         draw_drone_frame(ax, xSk[0], ySk[0], psiS[idx])
     
-    # Frame RTK en el origen
+    # Frame RTK en el origen (con sus propias reglas de inversión)
     draw_rtk_frame(ax)
     
-    # Leyenda optimizada (ubicada en la esquina superior derecha o izquierda)
-    # Se crean elementos fantasma para la leyenda sin interferir con el frame RTK
+    # Leyenda
     ax.plot([], [], '-', color=[0.85, 0.10, 0.10], lw=2.0, label=r'$\hat{x}_D$')
     ax.plot([], [], '-', color=[0.10, 0.65, 0.10], lw=2.0, label=r'$\hat{y}_D$')
     ax.plot([], [], '-', color=C_form, lw=1.5, label=r'Vector $\mathbf{d}$')
@@ -392,13 +431,18 @@ def plot_results(buf):
     
     # ==================== FIGURA 2 - Líder ====================
     fig2, ax = plt.subplots(figsize=(7, 7), facecolor='white')
-    ax.plot(xdesL, ydesL, '--', color=C_refL, lw=LWS, label='Setpoint Líder')
-    ax.plot(xL, yL, '-', color=C_L, lw=LW, label='Líder real')
-    ax.plot(xL[0], yL[0], 'o', ms=9, mfc=C_L, mec='k', label='Inicio')
     
-    # Frames del líder
-    for idx in idx_frames[:4]:  # menos frames para no saturar
-        draw_drone_frame(ax, xL[idx], yL[idx], psiL[idx])
+    xdesL_inv, ydesL_inv = transform_trayectoria(xdesL, ydesL)
+    xL_inv, yL_inv = transform_trayectoria(xL, yL)
+    xL0_inv, yL0_inv = transform_trayectoria(np.array([xL[0]]), np.array([yL[0]]))
+    
+    ax.plot(xdesL_inv, ydesL_inv, '--', color=C_refL, lw=LWS, label='Setpoint Líder')
+    ax.plot(xL_inv, yL_inv, '-', color=C_L, lw=LW, label='Líder real')
+    ax.plot(xL0_inv[0], yL0_inv[0], 'o', ms=9, mfc=C_L, mec='k', label='Inicio')
+    
+    for idx in idx_frames[:4]:
+        xLk, yLk = transform_trayectoria(np.array([xL[idx]]), np.array([yL[idx]]))
+        draw_drone_frame(ax, xLk[0], yLk[0], psiL[idx])
     
     draw_rtk_frame(ax)
     ax.plot([], [], '-', color=[0.85, 0.10, 0.10], lw=2.0, label=r'$\hat{x}_D$')
@@ -411,12 +455,18 @@ def plot_results(buf):
     
     # ==================== FIGURA 3 - Seguidor ====================
     fig3, ax = plt.subplots(figsize=(7, 7), facecolor='white')
-    ax.plot(xdesS, ydesS, '--', color=C_refS, lw=LWS, label='Setpoint Seguidor')
-    ax.plot(xS, yS, '-', color=C_S, lw=LW, label='Seguidor real')
-    ax.plot(xS[0], yS[0], 'o', ms=9, mfc=C_S, mec='k', label='Inicio')
+    
+    xdesS_inv, ydesS_inv = transform_trayectoria(xdesS, ydesS)
+    xS_inv, yS_inv = transform_trayectoria(xS, yS)
+    xS0_inv, yS0_inv = transform_trayectoria(np.array([xS[0]]), np.array([yS[0]]))
+    
+    ax.plot(xdesS_inv, ydesS_inv, '--', color=C_refS, lw=LWS, label='Setpoint Seguidor')
+    ax.plot(xS_inv, yS_inv, '-', color=C_S, lw=LW, label='Seguidor real')
+    ax.plot(xS0_inv[0], yS0_inv[0], 'o', ms=9, mfc=C_S, mec='k', label='Inicio')
     
     for idx in idx_frames[:4]:
-        draw_drone_frame(ax, xS[idx], yS[idx], psiS[idx])
+        xSk, ySk = transform_trayectoria(np.array([xS[idx]]), np.array([yS[idx]]))
+        draw_drone_frame(ax, xSk[0], ySk[0], psiS[idx])
     
     draw_rtk_frame(ax)
     ax.plot([], [], '-', color=[0.85, 0.10, 0.10], lw=2.0, label=r'$\hat{x}_D$')
@@ -501,8 +551,19 @@ def plot_results(buf):
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
-    print(f'\n🔄 Configuración de inversión de ejes: X={"INVERTIDO" if INVERTIR_EJE_X else "NORMAL"}, '
-          f'Y={"INVERTIDO" if INVERTIR_EJE_Y else "NORMAL"}')
+    print(f'\n{"="*60}')
+    print('CONFIGURACIÓN DE INVERSIÓN:')
+    print(f'{"="*60}')
+    print(f'1. TRAYECTORIAS:')
+    print(f'   INVERTIR_TRAYECTORIA_X = {INVERTIR_TRAYECTORIA_X}')
+    print(f'   INVERTIR_TRAYECTORIA_Y = {INVERTIR_TRAYECTORIA_Y}')
+    print(f'2. FRAME RTK (centro):')
+    print(f'   INVERTIR_RTK_X = {INVERTIR_RTK_X}')
+    print(f'   INVERTIR_RTK_Y = {INVERTIR_RTK_Y}')
+    print(f'3. FRAMES DE DRONES:')
+    print(f'   INVERTIR_DRONE_X = {INVERTIR_DRONE_X}')
+    print(f'   INVERTIR_DRONE_Y = {INVERTIR_DRONE_Y}')
+    print(f'{"="*60}\n')
     
     leader_data = load_leader_csv(LEADER_CSV)
     duration = leader_data[-1]['t']
