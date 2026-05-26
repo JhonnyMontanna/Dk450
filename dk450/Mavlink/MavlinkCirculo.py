@@ -20,10 +20,10 @@ import numpy as np
 # ===============================
 # CONFIGURACIÓN
 # ===============================
-CONN          = 'udp:127.0.0.1:14552'
-SYSID         = 1
+CONN          = 'udp:127.0.0.1:14553'
+SYSID         = 2
 COMPID        = 0
-RADIUS        = 8.0     # metros
+RADIUS        = 4.0     # metros
 ANGULAR_SPEED = 0.2     # rad/s
 RATE          = 50      # Hz
 

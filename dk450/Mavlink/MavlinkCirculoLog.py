@@ -45,7 +45,7 @@ CONN          = 'udp:127.0.0.1:14552'
 SYSID         = 1
 COMPID        = 0
 
-RADIUS        = 4.0     # metros
+RADIUS        = 5.0     # metros
 ANGULAR_SPEED = 0.4     # rad/s
 RATE          = 50      # Hz
 

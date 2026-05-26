@@ -24,7 +24,7 @@ FOLLOWER_COMPID = 1
 
 # ── Offset polar ──────────────────────────────────────────────────────────────
 OFFSET_D     = 1.0
-OFFSET_ALPHA = -math.pi/2
+OFFSET_ALPHA = 0.0  #-math.pi/2
 OFFSET_DZ    = 1.0
 
 # ── Ganancias PID ─────────────────────────────────────────────────────────────
@@ -38,7 +38,7 @@ RATE, DT = 20, 0.05
 SPEED_FACTOR = 1.0
 
 # ── Archivos ──────────────────────────────────────────────────────────────────
-LEADER_CSV = 'circulo_log_SITL1.csv'
+LEADER_CSV = 'circulo_log_1778277955.csv'
 
 # ── Pre-posicionamiento ───────────────────────────────────────────────────────
 PRE_POSITION = True
@@ -233,38 +233,50 @@ def send_position_yaw(master, x, y, z_ned, yaw):
         mavutil.mavlink.MAV_FRAME_LOCAL_NED, TYPE_MASK_POS_YAW,
         x, y, z_ned, 0, 0, 0, 0, 0, 0, yaw, 0)
 
-def goto_initial_position(master, leader_data: list):
+def goto_initial_position(master, leader_data):
     L0 = leader_data[0]
     dx, dy, dz = compute_offset(L0['yaw'])
-    x_target, y_target, z_target = L0['x'] + dx, L0['y'] + dy, L0['z'] + dz
-    z_ned, yaw_target = -z_target, L0['yaw']
+    x_target, y_target = L0['x'] + dx, L0['y'] + dy
     
-    print(f'\n📌 Pre-posicionamiento: objetivo=({x_target:.2f}, {y_target:.2f}, {z_target:.2f})')
+    # Obtener la altura actual del drone
+    S = get_follower()
+    if not follower_ready(S):
+        print('⚠️ No se pudo obtener la altura actual del drone')
+        return False
+    
+    z_current = S['z']  # Altura actual en metros
+    z_ned = -z_current   # Convertir a frame NED (negativo porque en NED z es hacia abajo)
+    yaw_target = L0['yaw']
+    
+    print(f'\n📌 Pre-posicionamiento: objetivo=({x_target:.2f}, {y_target:.2f}, manteniendo altura actual={z_current:.2f})')
     input('▶️ Presiona ENTER para mover el drone al punto inicial...\n')
     
     dt_pre, t_start, t_in_zone = 1.0/PRE_RATE, time.monotonic(), None
     
     while True:
         elapsed = time.monotonic() - t_start
+        # Enviar comando de posición manteniendo la altura actual
         send_position_yaw(master, x_target, y_target, z_ned, yaw_target)
         
         S = get_follower()
         if follower_ready(S):
             dist_xy = math.hypot(S['x'] - x_target, S['y'] - y_target)
-            dist_z, speed = abs(S['z'] - z_target), math.hypot(S['vx'], S['vy'])
+            # Solo verificamos distancia en XY, no en Z
+            speed = math.hypot(S['vx'], S['vy'])
             
-            if (dist_xy < PRE_CONV_RADIUS and dist_z < PRE_CONV_Z and speed < PRE_CONV_SPEED):
-                if t_in_zone is None: t_in_zone = time.monotonic()
+            if (dist_xy < PRE_CONV_RADIUS and speed < PRE_CONV_SPEED):
+                if t_in_zone is None:
+                    t_in_zone = time.monotonic()
                 elif time.monotonic() - t_in_zone >= PRE_CONV_HOLD:
-                    print(f'✅ Pre-posicionamiento completado')
+                    print(f'✅ Pre-posicionamiento completado (altura mantenida en {z_current:.2f}m)')
                     return True
-            else: t_in_zone = None
+            else:
+                t_in_zone = None
         
         if elapsed >= PRE_CONV_TIMEOUT:
             print(f'⚠️ Timeout de pre-posicionamiento')
             return False
         time.sleep(dt_pre)
-
 # ──────────────────────────────────────────────────────────────────────────────
 # FUNCIONES DE VISUALIZACIÓN (CON CONTROLES INDEPENDIENTES)
 # ──────────────────────────────────────────────────────────────────────────────
