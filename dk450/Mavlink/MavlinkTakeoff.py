@@ -3,7 +3,7 @@ import time
 from pymavlink import mavutil
 
 # 1) Conexión al SITL
-master = mavutil.mavlink_connection('udp:127.0.0.1:14552')
+master = mavutil.mavlink_connection('udp:127.0.0.1:14553')
 
 master.wait_heartbeat()
 print(f"🔗 Conectado: SYS={master.target_system} COMP={master.target_component}")
