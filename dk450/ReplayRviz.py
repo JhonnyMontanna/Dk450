@@ -1,49 +1,44 @@
 #!/usr/bin/env python3
 """
-rviz_replay.py
-==============
+rviz_replay_v2.py
+=================
 Reproduce en RViz2 la trayectoria líder-seguidor desde master_telemetry.csv.
+Basado en MavrosVisualizer.py — usa el mismo pipeline GPS→ECEF→ENU→RTK local.
 
-REPRODUCCIÓN ANIMADA:
-  - Avanza a velocidad real (o con factor de escala PLAYBACK_SPEED).
-  - Publica la trayectoria acumulada hasta el instante t actual.
-  - Una esfera "posición actual" se mueve en tiempo real para cada dron.
-  - Al terminar, la trayectoria completa queda estática en RViz.
+COORDENADAS:
+  El mismo cálculo que MultiDroneVisualizer:
+    GPS (lat,lon,alt) → ECEF → ENU → rotación theta → frame rtk_odom
+  Así la trayectoria replay se alinea perfectamente con el visualizador en vivo.
 
-DIFERENCIACIÓN VISUAL:
-  Drones   → color fijo  (líder: azul, seguidor: rojo)
-  Fases    → grosor + alpha de la línea:
-               TAKEOFF      delgado  0.03 m  alpha 0.35
-               POSITIONING  medio    0.05 m  alpha 0.60
-               TRAJECTORY   grueso   0.10 m  alpha 1.00
-               LANDING      delgado  0.03 m  alpha 0.40
-  Marcadores especiales (esferas):
-               ★ Inicio físico de cada dron
-               ● Condición inicial de TRAJECTORY
-               ◇ Setpoint de preposicionamiento
+DIFERENCIACIÓN VISUAL (RViz2 no soporta líneas punteadas):
+  Drones  → color fijo   (líder: azul  #1565C0 | seguidor: rojo #C62828)
+  Fases   → grosor + alpha de línea:
+              TAKEOFF      0.03 m  alpha 0.35
+              POSITIONING  0.05 m  alpha 0.65
+              TRAJECTORY   0.10 m  alpha 1.00
+              LANDING      0.03 m  alpha 0.45
 
-TÓPICOS PUBLICADOS (todos en /replay/...):
-  /replay/leader/trajectory        LINE_LIST por segmentos (acumulado)
-  /replay/follower/trajectory      LINE_LIST por segmentos (acumulado)
-  /replay/leader/current_pos       SPHERE — posición actual animada
-  /replay/follower/current_pos     SPHERE — posición actual animada
-  /replay/leader/markers           SPHERE_LIST — inicio, CI, SP
-  /replay/follower/markers         SPHERE_LIST — inicio, CI, SP
-  /replay/phase_label              TEXT_VIEW_FACING — fase activa actual
+MARCADORES:
+  ★ Esfera grande  — inicio físico de cada dron
+  ● Esfera media   — condición inicial de TRAJECTORY
+  ■ Cubo aplanado  — setpoint de preposicionamiento
+  Círculos teóricos como LINE_STRIP
 
-FRAME: map  (asegúrate de tener fixed frame = map en RViz2)
+TÓPICOS:
+  /replay/trajectory       MarkerArray — trayectoria acumulada animada
+  /replay/current_pos      MarkerArray — esfera posición actual
+  /replay/static_markers   MarkerArray — marcadores fijos (una vez)
+  /replay/phase_label      MarkerArray — texto fase + tiempo
+
+FRAME: rtk_odom  (mismo que MavrosVisualizer)
 
 USO:
-  # Terminal 1
-  ros2 run rviz2 rviz2
+  python3 rviz_replay_v2.py --master master_telemetry.csv --speed 1.0
 
-  # Terminal 2
-  python3 rviz_replay.py
-  python3 rviz_replay.py --master mi_log.csv --speed 2.0
-
-DEPENDENCIAS:
-  pip install pandas numpy
-  ROS2 Humble + rclpy + visualization_msgs + geometry_msgs
+  Parámetros opcionales (mismos que MavrosVisualizer):
+    --origin_lat  --origin_lon  --origin_alt
+    --calib_ang
+    --speed   (factor de velocidad, default 1.0)
 """
 
 import sys
@@ -68,16 +63,20 @@ from builtin_interfaces.msg import Duration
 # =============================================================================
 
 CSV_FILE       = "master_telemetry.csv"
-PLAYBACK_SPEED = 1.0      # 1.0 = tiempo real, 2.0 = doble velocidad, 0.5 = mitad
-FRAME_ID       = "map"
-PUBLISH_RATE   = 20       # Hz — frecuencia de publicación del loop animado
+PLAYBACK_SPEED = 1.0      # 1.0=tiempo real | 2.0=doble velocidad
+PUBLISH_RATE   = 20       # Hz
 
-# Parámetros del experimento (para referencias teóricas)
-RADIUS    = 4.0
-OFFSET_D  = 2.0
-OFFSET_DZ = 1.0
+# ── Origen RTK (igual que MavrosVisualizer) ───────────────────────────────────
+ORIGIN_LAT = 19.5942341
+ORIGIN_LON = -99.2280871
+ORIGIN_ALT = 2329.0
 
-# Tiempos de fase (segundos) ← AJUSTAR con los tiempos reales del vuelo
+# ── Calibración angular ───────────────────────────────────────────────────────
+# Ángulo de rotación CCW en grados (calib_mode='angle' de MavrosVisualizer)
+# Ajustar para que el norte apunte correctamente en RViz
+CALIB_ANG_DEG = 180.0
+
+# ── Fases de vuelo (segundos) — AJUSTAR con los tiempos reales ───────────────
 PHASE_TIMES = {
     "TAKEOFF":     (0.0,    15.0),
     "POSITIONING": (15.0,   45.0),
@@ -85,284 +84,300 @@ PHASE_TIMES = {
     "LANDING":     (145.0,  None),   # None = hasta el final
 }
 
-# Setpoints de preposicionamiento en ENU local (antes de recentrar)
+# ── Parámetros del experimento ────────────────────────────────────────────────
+RADIUS    = 4.0    # radio teórico círculo líder [m]
+OFFSET_D  = 2.0    # separación teórica líder-seguidor [m]
+OFFSET_DZ = 1.0    # diferencia de altitud objetivo [m]
+
+# ── Setpoints de preposicionamiento en coordenadas RTK local ─────────────────
+# Poner None si no aplica
 SP_PREPOS = {
     "L": {"x": -4.0, "y": 0.0, "z": 4.0},
     "S": {"x": -6.0, "y": 0.0, "z": 4.0},
 }
 
-# Correcciones de recentrado (mismas que reconstruir_trayectoria_v3.py)
-CENTER_OFFSET_X          =  0.0
-CENTER_OFFSET_Y          =  0.0
-CENTER_OFFSET_Z_LEADER   =  0.0
-CENTER_OFFSET_Z_FOLLOWER =  0.0
-
-# Fracción a recortar para el ajuste del círculo
-CIRCLE_TRIM_START = 0.10
-CIRCLE_TRIM_END   = 0.05
-
 # =============================================================================
 # FIN DE CONFIGURACIÓN
 # =============================================================================
 
-R_EARTH = 6_371_000.0
+# WGS84
+WGS84_A  = 6_378_137.0
+WGS84_E2 = 6.69437999014e-3
 
-# ── Colores de dron ───────────────────────────────────────────────────────────
-COLOR_LEADER   = (0.15, 0.40, 0.85, 1.0)   # RGBA azul
-COLOR_FOLLOWER = (0.85, 0.15, 0.15, 1.0)   # RGBA rojo
-COLOR_THEORY   = (0.75, 0.75, 0.75, 0.50)  # gris semitransparente
+# Colores dron (RGBA 0-1)
+COLOR_LEADER   = (0.15, 0.40, 0.85, 1.0)
+COLOR_FOLLOWER = (0.85, 0.15, 0.15, 1.0)
 
-# ── Grosor y alpha por fase ────────────────────────────────────────────────────
-#   { "FASE": (scale_m, alpha) }
+# Grosor [m] y alpha por fase
 PHASE_VIZ = {
     "TAKEOFF":     (0.030, 0.35),
     "POSITIONING": (0.050, 0.65),
     "TRAJECTORY":  (0.100, 1.00),
     "LANDING":     (0.030, 0.45),
-    "UNKNOWN":     (0.020, 0.20),
+    "UNKNOWN":     (0.015, 0.20),
 }
 
-# ── Tamaños de marcadores esféricos ──────────────────────────────────────────
-SPHERE_CURRENT  = 0.25   # m — posición actual (animada)
-SPHERE_START    = 0.30   # m — inicio físico ★
-SPHERE_CI       = 0.22   # m — condición inicial ●
-SPHERE_SP       = 0.20   # m — setpoint preposicionamiento ◇ (usamos esfera achatada)
+PHASE_LABEL = {
+    "TAKEOFF":     "DESPEGUE",
+    "POSITIONING": "POSICIONAMIENTO",
+    "TRAJECTORY":  "TRAYECTORIA / CONTROL",
+    "LANDING":     "ATERRIZAJE",
+    "UNKNOWN":     "",
+}
+
+SPHERE_CURRENT = 0.25
+SPHERE_START   = 0.35
+SPHERE_CI      = 0.22
+CUBE_SP        = 0.20
+
+
+# =============================================================================
+# PIPELINE DE COORDENADAS (igual que MavrosVisualizer)
+# =============================================================================
+
+def geodetic_to_ecef(lat_r, lon_r, alt):
+    N = WGS84_A / math.sqrt(1.0 - WGS84_E2 * math.sin(lat_r)**2)
+    x = (N + alt) * math.cos(lat_r) * math.cos(lon_r)
+    y = (N + alt) * math.cos(lat_r) * math.sin(lon_r)
+    z = (N * (1.0 - WGS84_E2) + alt) * math.sin(lat_r)
+    return x, y, z
+
+
+def get_rotation_matrix(lat_r, lon_r):
+    return np.array([
+        [-math.sin(lon_r),
+          math.cos(lon_r),
+          0.0],
+        [-math.sin(lat_r) * math.cos(lon_r),
+         -math.sin(lat_r) * math.sin(lon_r),
+          math.cos(lat_r)],
+        [ math.cos(lat_r) * math.cos(lon_r),
+          math.cos(lat_r) * math.sin(lon_r),
+          math.sin(lat_r)],
+    ])
+
+
+def gps_to_rtk(lat_deg, lon_deg, alt,
+               X0, Y0, Z0, R_enu, theta):
+    """
+    Convierte GPS (grados, metros) al frame RTK local.
+    Pipeline idéntico a cb_navsat() en MavrosVisualizer.
+    Devuelve (xr, yr, zr).
+    """
+    lat_r = math.radians(lat_deg)
+    lon_r = math.radians(lon_deg)
+    Xe, Ye, Ze = geodetic_to_ecef(lat_r, lon_r, alt)
+    d   = np.array([Xe - X0, Ye - Y0, Ze - Z0])
+    enu = R_enu.dot(d)
+    xr  = enu[0] * math.cos(theta) - enu[1] * math.sin(theta)
+    yr  = enu[0] * math.sin(theta) + enu[1] * math.cos(theta)
+    zr  = float(enu[2])
+    return xr, yr, zr
 
 
 # =============================================================================
 # UTILIDADES DE DATOS
 # =============================================================================
 
-def gps_to_enu(lat, lon, ref_lat, ref_lon):
-    ref_lat_r = math.radians(ref_lat)
-    x = math.radians(lat - ref_lat) * R_EARTH
-    y = math.radians(lon - ref_lon) * R_EARTH * math.cos(ref_lat_r)
-    return x, y   # x=norte, y=este
-
-
-def fit_circle(x, y):
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    valid = np.isfinite(x) & np.isfinite(y)
-    x, y = x[valid], y[valid]
-    if len(x) < 4:
-        return 0.0, 0.0, RADIUS
-    A = np.column_stack([2*x, 2*y, np.ones(len(x))])
-    b = x**2 + y**2
-    res, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-    cx, cy = res[0], res[1]
-    r = math.sqrt(max(res[2] + cx**2 + cy**2, 0.0))
-    return cx, cy, r
-
-
 def assign_phases(t_arr, phase_times):
     phases = np.full(len(t_arr), "UNKNOWN", dtype=object)
-    t_max  = t_arr[-1]
+    t_max  = float(t_arr[-1])
     for name, interval in phase_times.items():
         if interval is None:
             continue
         t0, t1 = interval
-        t1 = t_max if t1 is None else t1
+        t1 = t_max if t1 is None else float(t1)
         phases[(t_arr >= t0) & (t_arr <= t1)] = name
     return phases
 
 
-def load_data(path):
+def phase_segments(phases, label):
+    segs, n, i = [], len(phases), 0
+    while i < n:
+        if phases[i] == label:
+            j = i
+            while j < n and phases[j] == label:
+                j += 1
+            segs.append((i, j))
+            i = j
+        else:
+            i += 1
+    return segs
+
+
+def load_data(path, X0, Y0, Z0, R_enu, theta):
+    """
+    Carga el CSV y convierte GPS→RTK local usando el mismo pipeline
+    que MavrosVisualizer. Altitud: usa L_alt/S_alt (GPS barométrico)
+    descontando la altitud de suelo para obtener altura relativa.
+    """
     print(f"[IO] Cargando {path} …")
     df = pd.read_csv(path, sep=None, engine="python")
     df = df.sort_values("t").reset_index(drop=True)
-    print(f"     {len(df)} filas")
+    print(f"     {len(df)} filas · {len(df.columns)} columnas")
 
-    # Origen ENU
-    mask = df["L_lat"].notna() & df["L_lon"].notna()
-    first = df[mask].iloc[0]
-    ref_lat, ref_lon = float(first["L_lat"]), float(first["L_lon"])
-
-    # ENU por dron
-    for pfx in ("L", "S"):
-        has = df[f"{pfx}_lat"].notna() & df[f"{pfx}_lon"].notna()
-        ex  = np.full(len(df), np.nan)
-        ey  = np.full(len(df), np.nan)
-        if has.any():
-            vals = df.loc[has, [f"{pfx}_lat", f"{pfx}_lon"]].apply(
-                lambda r: gps_to_enu(r[f"{pfx}_lat"], r[f"{pfx}_lon"],
-                                     ref_lat, ref_lon), axis=1)
-            ex[has.values] = [v[0] for v in vals]
-            ey[has.values] = [v[1] for v in vals]
-        df[f"{pfx}_ex"] = ex
-        df[f"{pfx}_ey"] = ey
-
-    # Altitud
-    for pfx in ("L", "S"):
-        off = CENTER_OFFSET_Z_LEADER if pfx == "L" else CENTER_OFFSET_Z_FOLLOWER
-        alt_col = f"{pfx}_alt"
-        z_col   = f"{pfx}_z"
-        if alt_col in df.columns and df[alt_col].notna().any():
-            alt_v  = df[alt_col].values.astype(float)
-            ground = np.nanmin(alt_v[:min(20, len(alt_v))])
-            df[f"{pfx}_cz"] = alt_v - ground + off
-        elif z_col in df.columns:
-            df[f"{pfx}_cz"] = -df[z_col].values.astype(float) + off
-        else:
-            df[f"{pfx}_cz"] = np.nan
-
-    # Fases
     t_arr  = df["t"].values
     phases = assign_phases(t_arr, PHASE_TIMES)
     df["phase"] = phases
 
-    # Ajuste de círculo (solo TRAJECTORY)
-    traj_mask = phases == "TRAJECTORY"
-    if traj_mask.sum() > 10:
-        idx = np.where(traj_mask)[0]
-        n_t = len(idx)
-        i0  = idx[int(n_t * CIRCLE_TRIM_START)]
-        i1  = idx[max(0, int(n_t * (1 - CIRCLE_TRIM_END)) - 1)]
-        fit_m = np.zeros(len(df), dtype=bool)
-        fit_m[i0:i1+1] = True
-        fit_m &= traj_mask
-        cx_fit, cy_fit, r_fit = fit_circle(
-            df.loc[fit_m, "L_ex"].values,
-            df.loc[fit_m, "L_ey"].values)
-        print(f"[Círculo] Centro=({cx_fit:.3f}, {cy_fit:.3f})  R={r_fit:.3f} m")
-    else:
-        cx_fit, cy_fit, r_fit = 0.0, 0.0, RADIUS
+    # ── Convertir GPS → RTK local por dron ───────────────────────────────────
+    for pfx in ("L", "S"):
+        has = df[f"{pfx}_lat"].notna() & df[f"{pfx}_lon"].notna()
 
-    ox = cx_fit + CENTER_OFFSET_X
-    oy = cy_fit + CENTER_OFFSET_Y
-    df["L_rx"] = df["L_ex"] - ox
-    df["L_ry"] = df["L_ey"] - oy
-    df["S_rx"] = df["S_ex"] - ox
-    df["S_ry"] = df["S_ey"] - oy
+        # Altitud: preferir _alt (GPS absoluto), caer a -_z (NED)
+        alt_col = f"{pfx}_alt"
+        z_col   = f"{pfx}_z"
+        if alt_col in df.columns and df[alt_col].notna().any():
+            alt_vals = df[alt_col].values.astype(float)
+        elif z_col in df.columns and df[z_col].notna().any():
+            alt_vals = -df[z_col].values.astype(float) + ORIGIN_ALT
+        else:
+            alt_vals = np.full(len(df), ORIGIN_ALT)
 
-    # Ajustar SP_PREPOS con el mismo offset
-    sp_centered = {}
-    for k, v in SP_PREPOS.items():
-        sp_centered[k] = {
-            "x": v["x"] - ox,   # norte
-            "y": v["y"] - oy,   # este
-            "z": v["z"],
-        }
+        xr = np.full(len(df), np.nan)
+        yr = np.full(len(df), np.nan)
+        zr = np.full(len(df), np.nan)
 
-    meta = {
-        "r_fit": r_fit, "ox": ox, "oy": oy,
-        "ref_lat": ref_lat, "ref_lon": ref_lon,
-        "sp_centered": sp_centered,
-    }
-    return df, meta
+        for i in np.where(has.values)[0]:
+            lat = float(df.at[i, f"{pfx}_lat"])
+            lon = float(df.at[i, f"{pfx}_lon"])
+            alt = float(alt_vals[i])
+            if math.isfinite(lat) and math.isfinite(lon) and math.isfinite(alt):
+                xr[i], yr[i], zr[i] = gps_to_rtk(lat, lon, alt,
+                                                   X0, Y0, Z0, R_enu, theta)
+
+        # Altitud relativa al suelo (restar mínimo inicial)
+        valid_z = zr[np.isfinite(zr)]
+        if len(valid_z):
+            z_ground = np.min(valid_z[:max(1, min(20, len(valid_z)))])
+            zr = zr - z_ground
+
+        df[f"{pfx}_rx"] = xr   # norte en RTK local
+        df[f"{pfx}_ry"] = yr   # este  en RTK local
+        df[f"{pfx}_rz"] = zr   # altura sobre suelo
+
+    # Resumen de fases
+    print("[Fases]")
+    for ph in ["TAKEOFF", "POSITIONING", "TRAJECTORY", "LANDING", "UNKNOWN"]:
+        segs = phase_segments(phases, ph)
+        if not segs:
+            continue
+        total = sum(t_arr[min(i1-1, len(t_arr)-1)] - t_arr[i0] for i0, i1 in segs)
+        t0s = t_arr[segs[0][0]]
+        t1s = t_arr[min(segs[-1][1]-1, len(t_arr)-1)]
+        print(f"  {ph:<14s}: {total:6.1f} s  (t={t0s:.1f}–{t1s:.1f} s)")
+
+    return df
 
 
 # =============================================================================
 # UTILIDADES DE MARKERS
 # =============================================================================
 
-def rgba(r, g, b, a=1.0):
+FRAME_ID = "rtk_odom"   # mismo que MavrosVisualizer
+
+
+def _stamp(node, m):
+    m.header.stamp = node.get_clock().now().to_msg()
+    return m
+
+
+def _lifetime_inf():
+    d = Duration(); d.sec = 0; d.nanosec = 0
+    return d
+
+
+def _rgba(r, g, b, a=1.0):
     c = ColorRGBA()
     c.r, c.g, c.b, c.a = float(r), float(g), float(b), float(a)
     return c
 
 
-def pt(x, y, z):
-    """Crea Point con convención RViz: x=este, y=norte, z=arriba."""
+def _pt(xr, yr, zr):
+    """
+    Convierte coordenadas RTK local a Point de RViz.
+    En rtk_odom: x=este (yr), y=norte (xr), z=arriba (zr)
+    """
     p = Point()
-    p.x, p.y, p.z = float(y), float(x), float(z)   # RViz ENU: x=este, y=norte
+    p.x = float(yr)    # este
+    p.y = float(xr)    # norte
+    p.z = float(zr)
     return p
 
 
-def lifetime_inf():
-    d = Duration()
-    d.sec = 0; d.nanosec = 0   # 0 = permanente
-    return d
-
-
-def make_line_list_marker(marker_id, ns, color_rgba, scale):
+def make_line_list(mid, ns, color_rgba, scale):
     m = Marker()
     m.header.frame_id = FRAME_ID
-    m.ns              = ns
-    m.id              = marker_id
-    m.type            = Marker.LINE_LIST
-    m.action          = Marker.ADD
-    m.scale.x         = float(scale)
-    m.color           = rgba(*color_rgba)
-    m.lifetime        = lifetime_inf()
-    m.pose.orientation.w = 1.0
-    return m
-
-
-def make_sphere_marker(marker_id, ns, color_rgba, scale, x, y, z):
-    m = Marker()
-    m.header.frame_id = FRAME_ID
-    m.ns              = ns
-    m.id              = marker_id
-    m.type            = Marker.SPHERE
-    m.action          = Marker.ADD
-    m.scale.x = m.scale.y = m.scale.z = float(scale)
-    m.color           = rgba(*color_rgba)
-    m.lifetime        = lifetime_inf()
-    m.pose.orientation.w = 1.0
-    m.pose.position   = pt(x, y, z)
-    return m
-
-
-def make_text_marker(marker_id, ns, text, x, y, z, scale=0.4):
-    m = Marker()
-    m.header.frame_id = FRAME_ID
-    m.ns              = ns
-    m.id              = marker_id
-    m.type            = Marker.TEXT_VIEW_FACING
-    m.action          = Marker.ADD
-    m.text            = text
-    m.scale.z         = float(scale)
-    m.color           = rgba(1.0, 1.0, 1.0, 0.95)
-    m.lifetime        = lifetime_inf()
-    m.pose.orientation.w = 1.0
-    m.pose.position   = pt(x, y, z)
-    return m
-
-
-def make_cylinder_marker(marker_id, ns, color_rgba, radius, height, x, y, z):
-    """Círculo teórico como cilindro muy aplanado."""
-    m = Marker()
-    m.header.frame_id = FRAME_ID
-    m.ns              = ns
-    m.id              = marker_id
-    m.type            = Marker.CYLINDER
-    m.action          = Marker.ADD
-    m.scale.x = m.scale.y = float(radius * 2)
-    m.scale.z = float(height)
-    m.color           = rgba(*color_rgba)
-    m.lifetime        = lifetime_inf()
-    m.pose.orientation.w = 1.0
-    m.pose.position   = pt(x, y, z)
-    return m
-
-
-def theory_circle_points(radius, n=120):
-    """Devuelve lista de puntos ENU para un círculo centrado en el origen."""
-    theta = np.linspace(0, 2*np.pi, n, endpoint=False)
-    return list(zip(np.zeros(n), radius * np.sin(theta), radius * np.cos(theta)))
-    # x=norte=0 → círculo en plano YZ de RViz... mejor:
-    # En ENU: norte=X, este=Y → círculo en plano XY
-    # rx = R*cos(theta), ry = R*sin(theta)
-
-
-def make_circle_line_strip(marker_id, ns, color_rgba, scale, radius, z_height, n=200):
-    """Círculo teórico como LINE_LIST (pares de puntos consecutivos)."""
-    m = Marker()
-    m.header.frame_id = FRAME_ID
-    m.ns   = ns
-    m.id   = marker_id
-    m.type = Marker.LINE_STRIP
+    m.ns, m.id = ns, mid
+    m.type   = Marker.LINE_LIST
     m.action = Marker.ADD
     m.scale.x = float(scale)
-    m.color   = rgba(*color_rgba)
-    m.lifetime = lifetime_inf()
+    m.color   = _rgba(*color_rgba)
+    m.lifetime = _lifetime_inf()
     m.pose.orientation.w = 1.0
-    theta = np.linspace(0, 2*np.pi, n)
+    return m
+
+
+def make_sphere(mid, ns, color_rgba, scale, xr, yr, zr):
+    m = Marker()
+    m.header.frame_id = FRAME_ID
+    m.ns, m.id = ns, mid
+    m.type   = Marker.SPHERE
+    m.action = Marker.ADD
+    m.scale.x = m.scale.y = m.scale.z = float(scale)
+    m.color   = _rgba(*color_rgba)
+    m.lifetime = _lifetime_inf()
+    m.pose.orientation.w = 1.0
+    m.pose.position = _pt(xr, yr, zr)
+    return m
+
+
+def make_cube(mid, ns, color_rgba, sx, sy, sz, xr, yr, zr):
+    m = Marker()
+    m.header.frame_id = FRAME_ID
+    m.ns, m.id = ns, mid
+    m.type   = Marker.CUBE
+    m.action = Marker.ADD
+    m.scale.x, m.scale.y, m.scale.z = float(sx), float(sy), float(sz)
+    m.color   = _rgba(*color_rgba)
+    m.lifetime = _lifetime_inf()
+    m.pose.orientation.w = 1.0
+    m.pose.position = _pt(xr, yr, zr)
+    return m
+
+
+def make_text(mid, ns, text, xr, yr, zr, scale=0.45):
+    m = Marker()
+    m.header.frame_id = FRAME_ID
+    m.ns, m.id = ns, mid
+    m.type   = Marker.TEXT_VIEW_FACING
+    m.action = Marker.ADD
+    m.text   = text
+    m.scale.z = float(scale)
+    m.color   = _rgba(1.0, 1.0, 1.0, 0.95)
+    m.lifetime = _lifetime_inf()
+    m.pose.orientation.w = 1.0
+    m.pose.position = _pt(xr, yr, zr)
+    return m
+
+
+def make_circle_strip(mid, ns, color_rgba, scale, radius, z_h, n=180):
+    """Círculo teórico como LINE_STRIP."""
+    m = Marker()
+    m.header.frame_id = FRAME_ID
+    m.ns, m.id = ns, mid
+    m.type   = Marker.LINE_STRIP
+    m.action = Marker.ADD
+    m.scale.x = float(scale)
+    m.color   = _rgba(*color_rgba)
+    m.lifetime = _lifetime_inf()
+    m.pose.orientation.w = 1.0
+    theta = np.linspace(0.0, 2.0 * math.pi, n)
     for th in theta:
-        rx = radius * math.cos(th)   # norte
-        ry = radius * math.sin(th)   # este
-        m.points.append(pt(rx, ry, z_height))
+        # radio en plano XY del frame RTK (norte=x, este=y)
+        xr_c = radius * math.cos(th)
+        yr_c = radius * math.sin(th)
+        m.points.append(_pt(xr_c, yr_c, z_h))
     return m
 
 
@@ -372,7 +387,7 @@ def make_circle_line_strip(marker_id, ns, color_rgba, scale, radius, z_height, n
 
 class ReplayNode(Node):
 
-    def __init__(self, df, meta, speed):
+    def __init__(self, df, speed):
         super().__init__("rviz_replay")
 
         qos = QoSProfile(
@@ -381,168 +396,144 @@ class ReplayNode(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
+        self._pub_traj    = self.create_publisher(MarkerArray, "/replay/trajectory",      qos)
+        self._pub_current = self.create_publisher(MarkerArray, "/replay/current_pos",     qos)
+        self._pub_static  = self.create_publisher(MarkerArray, "/replay/static_markers",  qos)
+        self._pub_label   = self.create_publisher(MarkerArray, "/replay/phase_label",     qos)
 
-        # ── Publicadores ──────────────────────────────────────────────────────
-        self._pub_traj    = self.create_publisher(MarkerArray,
-                            "/replay/trajectory",    qos)
-        self._pub_current = self.create_publisher(MarkerArray,
-                            "/replay/current_pos",   qos)
-        self._pub_static  = self.create_publisher(MarkerArray,
-                            "/replay/static_markers", qos)
-        self._pub_label   = self.create_publisher(MarkerArray,
-                            "/replay/phase_label",   qos)
-
-        self._df    = df
-        self._meta  = meta
-        self._speed = speed
-
+        self._df     = df
+        self._speed  = speed
         self._t_arr  = df["t"].values
         self._phases = df["phase"].values
 
-        # Pre-computar segmentos de trayectoria como pares de puntos LINE_LIST
-        # Un segmento = dos puntos consecutivos con mismo estilo
-        self._segments = self._build_segments()
+        # Pre-construir segmentos para el loop animado
+        self._segs = self._build_segments()
 
-        # Publicar marcadores estáticos una vez
+        # Publicar estáticos una vez al arrancar
         self._publish_static()
 
-        # Iniciar hilo de reproducción
-        self._stop = threading.Event()
+        self._stop   = threading.Event()
         self._thread = threading.Thread(target=self._replay_loop, daemon=True)
         self._thread.start()
+
+        dur = self._t_arr[-1] - self._t_arr[0]
         self.get_logger().info(
-            f"Reproducción iniciada | speed={speed}x | "
-            f"duración={self._t_arr[-1]-self._t_arr[0]:.1f} s"
+            f"Replay iniciado | speed={speed}x | duración={dur:.1f} s | "
+            f"frame={FRAME_ID}"
+        )
+        self.get_logger().info(
+            "Tópicos:\n"
+            "  /replay/trajectory      — trayectoria acumulada\n"
+            "  /replay/current_pos     — posición actual animada\n"
+            "  /replay/static_markers  — inicio ★  CI ●  SP ■\n"
+            "  /replay/phase_label     — fase y tiempo"
         )
 
-    # ── Pre-cómputo de segmentos ──────────────────────────────────────────────
+    # ── Pre-compómputo de segmentos ───────────────────────────────────────────
 
     def _build_segments(self):
         """
-        Construye lista de segmentos para LINE_LIST.
-        Cada segmento: (i_start, i_end, pfx, phase)
-        Con límites en cambios de fase.
+        Lista de (i_start, i_end, pfx, phase) con límites en cambios de fase.
         """
-        df     = self._df
-        phases = self._phases
-        segs   = []
-        n      = len(df)
-
+        df = self._df; phases = self._phases; n = len(df)
+        segs = []
         for pfx in ("L", "S"):
             rx = df[f"{pfx}_rx"].values
             ry = df[f"{pfx}_ry"].values
-            cz = df[f"{pfx}_cz"].values
-
+            rz = df[f"{pfx}_rz"].values
             i = 0
             while i < n - 1:
-                ph = phases[i]
-                j  = i + 1
-                # Avanzar mientras misma fase y datos válidos
+                ph = phases[i]; j = i + 1
                 while (j < n and phases[j] == ph
-                       and np.isfinite(rx[j]) and np.isfinite(ry[j])
-                       and np.isfinite(cz[j])):
+                       and np.isfinite(rx[j]) and np.isfinite(ry[j])):
                     j += 1
-                # Solo guardar si hay al menos 2 puntos válidos
-                valid = (np.isfinite(rx[i:j]) & np.isfinite(ry[i:j])
-                         & np.isfinite(cz[i:j]))
+                valid = np.isfinite(rx[i:j]) & np.isfinite(ry[i:j])
                 if valid.sum() >= 2:
                     segs.append((i, j, pfx, ph))
                 i = j
-
         return segs
 
-    # ── Marcadores estáticos (inicio, CI, SP, círculos teóricos) ─────────────
+    # ── Marcadores estáticos ──────────────────────────────────────────────────
 
     def _publish_static(self):
-        df   = self._df
-        meta = self._meta
-        arr  = MarkerArray()
-        mid  = 0
+        df     = self._df
+        phases = self._phases
+        arr    = MarkerArray()
+        mid    = 0
 
-        def stamp(m):
+        def add(m):
             m.header.stamp = self.get_clock().now().to_msg()
+            arr.markers.append(m)
             return m
 
-        # Círculo teórico líder
-        r_fit = meta["r_fit"]
-        z_traj = np.nanmean(df.loc[df["phase"]=="TRAJECTORY", "L_cz"].values) \
-                 if (df["phase"]=="TRAJECTORY").any() else 4.0
-        arr.markers.append(stamp(make_circle_line_strip(
-            mid, "theory", (0.75, 0.75, 0.75, 0.45), 0.03, r_fit, z_traj)))
+        # Altura media de la fase TRAJECTORY (para los círculos teóricos)
+        traj_mask = phases == "TRAJECTORY"
+        z_traj_L = float(np.nanmean(df.loc[traj_mask, "L_rz"])) if traj_mask.any() else 4.0
+        z_traj_S = float(np.nanmean(df.loc[traj_mask, "S_rz"])) if traj_mask.any() else 5.0
+
+        # Círculos teóricos
+        add(make_circle_strip(mid, "theory_leader",
+                              (0.70, 0.70, 0.70, 0.40), 0.025, RADIUS, z_traj_L))
         mid += 1
-        # Círculo teórico seguidor
-        arr.markers.append(stamp(make_circle_line_strip(
-            mid, "theory", (0.90, 0.50, 0.50, 0.40), 0.03, r_fit + OFFSET_D, z_traj + OFFSET_DZ)))
+        add(make_circle_strip(mid, "theory_follower",
+                              (0.90, 0.55, 0.55, 0.38), 0.025, RADIUS + OFFSET_D, z_traj_S))
         mid += 1
 
-        # Inicio físico ★ y CI ● por dron
         COLOR = {"L": COLOR_LEADER, "S": COLOR_FOLLOWER}
+        LABEL = {"L": "Líder", "S": "Seguidor"}
+
         for pfx in ("L", "S"):
             rx = df[f"{pfx}_rx"].values
             ry = df[f"{pfx}_ry"].values
-            cz = df[f"{pfx}_cz"].values
+            rz = df[f"{pfx}_rz"].values
             color = COLOR[pfx]
+            label = LABEL[pfx]
 
-            # Primer punto válido = inicio físico
+            # Primer punto válido → inicio ★
             valid_idx = np.where(np.isfinite(rx) & np.isfinite(ry))[0]
             if len(valid_idx):
                 i0 = valid_idx[0]
-                arr.markers.append(stamp(make_sphere_marker(
-                    mid, f"start_{pfx}", color, SPHERE_START,
-                    rx[i0], ry[i0], cz[i0] if np.isfinite(cz[i0]) else 0.0)))
+                z0 = rz[i0] if np.isfinite(rz[i0]) else 0.0
+                add(make_sphere(mid, f"start_{pfx}", color, SPHERE_START,
+                                rx[i0], ry[i0], z0))
                 mid += 1
-                label = "★ Líder" if pfx == "L" else "★ Seguidor"
-                arr.markers.append(stamp(make_text_marker(
-                    mid, f"start_label_{pfx}", label,
-                    rx[i0], ry[i0], (cz[i0] if np.isfinite(cz[i0]) else 0.0) + 0.5)))
+                add(make_text(mid, f"start_lbl_{pfx}",
+                              f"★ Inicio {label}",
+                              rx[i0], ry[i0], z0 + 0.6))
                 mid += 1
 
-            # Condición inicial de TRAJECTORY
-            traj_idx = np.where(self._phases == "TRAJECTORY")[0]
+            # Condición inicial TRAJECTORY → CI ●
+            traj_idx = np.where(phases == "TRAJECTORY")[0]
             if len(traj_idx):
                 i_ci = traj_idx[0]
                 if np.isfinite(rx[i_ci]) and np.isfinite(ry[i_ci]):
-                    arr.markers.append(stamp(make_sphere_marker(
-                        mid, f"ci_{pfx}", (*color[:3], 0.85), SPHERE_CI,
-                        rx[i_ci], ry[i_ci],
-                        cz[i_ci] if np.isfinite(cz[i_ci]) else 0.0)))
+                    z_ci = rz[i_ci] if np.isfinite(rz[i_ci]) else 0.0
+                    add(make_sphere(mid, f"ci_{pfx}",
+                                   (*color[:3], 0.85), SPHERE_CI,
+                                   rx[i_ci], ry[i_ci], z_ci))
                     mid += 1
-                    label = "● CI Líder" if pfx == "L" else "● CI Seguidor"
-                    arr.markers.append(stamp(make_text_marker(
-                        mid, f"ci_label_{pfx}", label,
-                        rx[i_ci], ry[i_ci],
-                        (cz[i_ci] if np.isfinite(cz[i_ci]) else 0.0) + 0.5, 0.30)))
+                    add(make_text(mid, f"ci_lbl_{pfx}",
+                                  f"● CI {label}",
+                                  rx[i_ci], ry[i_ci], z_ci + 0.5, 0.32))
                     mid += 1
 
-            # SP de preposicionamiento ◇
-            sp = meta["sp_centered"].get(pfx)
-            if sp:
-                # Cubo aplanado para simular ◇
-                m_sp = Marker()
-                m_sp.header.frame_id = FRAME_ID
-                m_sp.header.stamp    = self.get_clock().now().to_msg()
-                m_sp.ns     = f"sp_{pfx}"
-                m_sp.id     = mid
-                m_sp.type   = Marker.CUBE
-                m_sp.action = Marker.ADD
-                m_sp.scale.x = m_sp.scale.y = SPHERE_SP
-                m_sp.scale.z = SPHERE_SP * 0.3
-                m_sp.color  = rgba(*color[:3], 0.70)
-                m_sp.lifetime = lifetime_inf()
-                m_sp.pose.orientation.w = 1.0
-                m_sp.pose.position = pt(sp["x"], sp["y"], sp["z"])
-                arr.markers.append(m_sp)
+            # SP de preposicionamiento → cubo ■
+            sp = SP_PREPOS.get(pfx)
+            if sp is not None:
+                add(make_cube(mid, f"sp_{pfx}",
+                              (*color[:3], 0.70),
+                              CUBE_SP, CUBE_SP, CUBE_SP * 0.3,
+                              sp["x"], sp["y"], sp["z"]))
                 mid += 1
-                label = "◇ SP Líder" if pfx == "L" else "◇ SP Seguidor"
-                arr.markers.append(stamp(make_text_marker(
-                    mid, f"sp_label_{pfx}", label,
-                    sp["x"], sp["y"], sp["z"] + 0.4, 0.28)))
+                add(make_text(mid, f"sp_lbl_{pfx}",
+                              f"■ SP {label}",
+                              sp["x"], sp["y"], sp["z"] + 0.45, 0.30))
                 mid += 1
 
         self._pub_static.publish(arr)
-        self.get_logger().info(f"Marcadores estáticos publicados ({mid} markers)")
+        self.get_logger().info(f"Marcadores estáticos: {mid} publicados")
 
-    # ── Loop de reproducción ──────────────────────────────────────────────────
+    # ── Loop animado ──────────────────────────────────────────────────────────
 
     def _replay_loop(self):
         df      = self._df
@@ -551,125 +542,104 @@ class ReplayNode(Node):
         speed   = self._speed
         dt_pub  = 1.0 / PUBLISH_RATE
 
-        t_data_start = t_arr[0]
-        t_data_end   = t_arr[-1]
+        t_start_data = float(t_arr[0])
+        t_end_data   = float(t_arr[-1])
         t_wall_start = time.monotonic()
 
         COLOR = {"L": COLOR_LEADER, "S": COLOR_FOLLOWER}
-        LABEL_LONG = {
-            "TAKEOFF":     "DESPEGUE",
-            "POSITIONING": "POSICIONAMIENTO",
-            "TRAJECTORY":  "TRAYECTORIA",
-            "LANDING":     "ATERRIZAJE",
-            "UNKNOWN":     "",
-        }
-
-        last_traj_idx = {"L": 0, "S": 0}  # índice hasta donde se publicó trayectoria
 
         while not self._stop.is_set():
-            t_wall_now  = time.monotonic()
-            t_elapsed   = (t_wall_now - t_wall_start) * speed
-            t_current   = t_data_start + t_elapsed
+            t_wall = time.monotonic()
+            t_data = t_start_data + (t_wall - t_wall_start) * speed
+            t_data = min(t_data, t_end_data)
 
-            if t_current > t_data_end:
-                t_current = t_data_end   # congelar al final
-
-            # Índice actual en el CSV
-            i_now = int(np.searchsorted(t_arr, t_current, side="right")) - 1
+            i_now = int(np.searchsorted(t_arr, t_data, side="right")) - 1
             i_now = max(0, min(i_now, len(t_arr) - 1))
 
             stamp = self.get_clock().now().to_msg()
 
             # ── Trayectoria acumulada ─────────────────────────────────────────
             traj_arr = MarkerArray()
-            mid      = 0
+            mid = 0
 
             for pfx in ("L", "S"):
                 color_base = COLOR[pfx]
                 rx = df[f"{pfx}_rx"].values
                 ry = df[f"{pfx}_ry"].values
-                cz = df[f"{pfx}_cz"].values
+                rz = df[f"{pfx}_rz"].values
 
-                for (i0, i1, seg_pfx, ph) in self._segments:
-                    if seg_pfx != pfx:
+                for (i0, i1, seg_pfx, ph) in self._segs:
+                    if seg_pfx != pfx or i0 > i_now:
                         continue
-                    if i0 > i_now:
-                        break   # aún no llega el tiempo a este segmento
-
                     i1_clip = min(i1, i_now + 1)
-                    scale, alpha = PHASE_VIZ.get(ph, (0.02, 0.20))
-                    color = (*color_base[:3], alpha)
+                    scale, alpha = PHASE_VIZ.get(ph, (0.015, 0.20))
 
-                    m = make_line_list_marker(mid, f"traj_{pfx}_{ph}", color, scale)
+                    m = make_line_list(mid, f"traj_{pfx}_{ph}",
+                                      (*color_base[:3], alpha), scale)
                     m.header.stamp = stamp
 
-                    # LINE_LIST: pares de puntos (p0,p1), (p1,p2) ...
                     for k in range(i0, i1_clip - 1):
-                        if (np.isfinite(rx[k]) and np.isfinite(ry[k])
-                                and np.isfinite(cz[k])
+                        if (np.isfinite(rx[k])   and np.isfinite(ry[k])
+                                and np.isfinite(rz[k])
                                 and np.isfinite(rx[k+1]) and np.isfinite(ry[k+1])
-                                and np.isfinite(cz[k+1])):
-                            m.points.append(pt(rx[k],   ry[k],   cz[k]))
-                            m.points.append(pt(rx[k+1], ry[k+1], cz[k+1]))
+                                and np.isfinite(rz[k+1])):
+                            m.points.append(_pt(rx[k],   ry[k],   rz[k]))
+                            m.points.append(_pt(rx[k+1], ry[k+1], rz[k+1]))
+
                     if m.points:
                         traj_arr.markers.append(m)
                     mid += 1
 
             self._pub_traj.publish(traj_arr)
 
-            # ── Posición actual (esferas animadas) ───────────────────────────
+            # ── Posición actual (esferas animadas) ────────────────────────────
             curr_arr = MarkerArray()
             cid = 0
             for pfx in ("L", "S"):
                 rx = df[f"{pfx}_rx"].values
                 ry = df[f"{pfx}_ry"].values
-                cz = df[f"{pfx}_cz"].values
-                color_base = COLOR[pfx]
+                rz = df[f"{pfx}_rz"].values
+                color = COLOR[pfx]
 
-                x_now = rx[i_now] if np.isfinite(rx[i_now]) else 0.0
-                y_now = ry[i_now] if np.isfinite(ry[i_now]) else 0.0
-                z_now = cz[i_now] if np.isfinite(cz[i_now]) else 0.0
+                x_c = rx[i_now] if np.isfinite(rx[i_now]) else 0.0
+                y_c = ry[i_now] if np.isfinite(ry[i_now]) else 0.0
+                z_c = rz[i_now] if np.isfinite(rz[i_now]) else 0.0
 
-                m_cur = make_sphere_marker(
-                    cid, f"current_{pfx}",
-                    (*color_base[:3], 0.95),
-                    SPHERE_CURRENT, x_now, y_now, z_now)
-                m_cur.header.stamp = stamp
-                curr_arr.markers.append(m_cur)
+                m_c = make_sphere(cid, f"current_{pfx}",
+                                  (*color[:3], 0.95), SPHERE_CURRENT,
+                                  x_c, y_c, z_c)
+                m_c.header.stamp = stamp
+                curr_arr.markers.append(m_c)
                 cid += 1
 
             self._pub_current.publish(curr_arr)
 
-            # ── Etiqueta de fase actual ───────────────────────────────────────
-            ph_now    = phases[i_now]
-            label_str = LABEL_LONG.get(ph_now, ph_now)
-            t_rel     = t_current - t_data_start
+            # ── Etiqueta fase + tiempo ────────────────────────────────────────
+            ph_now  = phases[i_now]
+            lbl_str = PHASE_LABEL.get(ph_now, ph_now)
+            t_rel   = t_data - t_start_data
 
-            # Posición del texto: sobre el líder actual
-            rx_L = df["L_rx"].values
-            ry_L = df["L_ry"].values
-            cz_L = df["L_cz"].values
+            rx_L = df["L_rx"].values; ry_L = df["L_ry"].values
+            rz_L = df["L_rz"].values
             x_lbl = rx_L[i_now] if np.isfinite(rx_L[i_now]) else 0.0
             y_lbl = ry_L[i_now] if np.isfinite(ry_L[i_now]) else 0.0
-            z_lbl = (cz_L[i_now] if np.isfinite(cz_L[i_now]) else 0.0) + 1.2
+            z_lbl = (rz_L[i_now] if np.isfinite(rz_L[i_now]) else 0.0) + 1.3
 
-            label_arr = MarkerArray()
-            m_lbl = make_text_marker(
-                0, "phase_label",
-                f"{label_str}\nt = {t_rel:.1f} s",
-                x_lbl, y_lbl, z_lbl, scale=0.45)
+            lbl_arr = MarkerArray()
+            m_lbl = make_text(0, "phase_label",
+                              f"{lbl_str}\nt = {t_rel:.1f} s",
+                              x_lbl, y_lbl, z_lbl, scale=0.45)
             m_lbl.header.stamp = stamp
-            label_arr.markers.append(m_lbl)
-            self._pub_label.publish(label_arr)
+            lbl_arr.markers.append(m_lbl)
+            self._pub_label.publish(lbl_arr)
 
-            # ── Dormir hasta siguiente publicación ────────────────────────────
-            elapsed_loop = time.monotonic() - t_wall_now
-            sleep_t = dt_pub - elapsed_loop
+            # ── Sleep exacto ──────────────────────────────────────────────────
+            sleep_t = dt_pub - (time.monotonic() - t_wall)
             if sleep_t > 0:
                 time.sleep(sleep_t)
 
-            if t_current >= t_data_end:
-                self.get_logger().info("Reproducción completada. Trayectoria estática activa.")
+            if t_data >= t_end_data:
+                self.get_logger().info("Reproducción completada — trayectoria estática activa.")
                 break
 
     def stop(self):
@@ -681,44 +651,62 @@ class ReplayNode(Node):
 # =============================================================================
 
 def main():
-    global FRAME_ID, PLAYBACK_SPEED
+    global ORIGIN_LAT, ORIGIN_LON, ORIGIN_ALT, CALIB_ANG_DEG, PLAYBACK_SPEED
 
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--master", default=CSV_FILE,
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--master",     default=CSV_FILE,
                     help=f"CSV de telemetría (default: {CSV_FILE})")
-    ap.add_argument("--speed",  type=float, default=PLAYBACK_SPEED,
-                    help=f"Factor de velocidad (default: {PLAYBACK_SPEED})")
-    ap.add_argument("--frame",  default=FRAME_ID,
-                    help=f"Frame de RViz2 (default: {FRAME_ID})")
+    ap.add_argument("--speed",      type=float, default=PLAYBACK_SPEED,
+                    help="Factor de velocidad (default: %(default)s)")
+    ap.add_argument("--origin_lat", type=float, default=ORIGIN_LAT,
+                    help="Latitud origen RTK (default: %(default)s)")
+    ap.add_argument("--origin_lon", type=float, default=ORIGIN_LON,
+                    help="Longitud origen RTK (default: %(default)s)")
+    ap.add_argument("--origin_alt", type=float, default=ORIGIN_ALT,
+                    help="Altitud origen RTK m (default: %(default)s)")
+    ap.add_argument("--calib_ang",  type=float, default=CALIB_ANG_DEG,
+                    help="Ángulo calibración CCW deg (default: %(default)s)")
     args = ap.parse_args()
 
-    FRAME_ID       = args.frame
+    ORIGIN_LAT    = args.origin_lat
+    ORIGIN_LON    = args.origin_lon
+    ORIGIN_ALT    = args.origin_alt
+    CALIB_ANG_DEG = args.calib_ang
     PLAYBACK_SPEED = args.speed
 
+    # ── Pre-cálculo del origen (igual que MultiDroneVisualizer.__init__) ──────
+    lat0_r = math.radians(ORIGIN_LAT)
+    lon0_r = math.radians(ORIGIN_LON)
+    X0, Y0, Z0 = geodetic_to_ecef(lat0_r, lon0_r, ORIGIN_ALT)
+    R_enu  = get_rotation_matrix(lat0_r, lon0_r)
+    theta  = math.radians(CALIB_ANG_DEG)
+
+    print(f"\n[Config] Origen RTK: lat={ORIGIN_LAT:.7f}  lon={ORIGIN_LON:.7f}  "
+          f"alt={ORIGIN_ALT:.1f} m")
+    print(f"[Config] calib_ang={CALIB_ANG_DEG:.1f}°  speed={PLAYBACK_SPEED}x")
+
     try:
-        df, meta = load_data(args.master)
+        df = load_data(args.master, X0, Y0, Z0, R_enu, theta)
     except FileNotFoundError:
-        print(f"[ERROR] No se encontró '{args.master}'")
+        print(f"\n[ERROR] No se encontró '{args.master}'")
+        print("        Usa --master /ruta/al/archivo.csv")
+        sys.exit(1)
+    except KeyError as e:
+        print(f"\n[ERROR] Columna no encontrada en el CSV: {e}")
         sys.exit(1)
 
     rclpy.init()
-    node = ReplayNode(df, meta, args.speed)
+    node = ReplayNode(df, args.speed)
 
-    print("\n══════════════════════════════════════════════════")
-    print("  RViz2 Replay — tópicos publicados:")
-    print("  /replay/trajectory      — trayectoria acumulada")
-    print("  /replay/current_pos     — posición actual (animada)")
-    print("  /replay/static_markers  — inicio ★, CI ●, SP ◇")
-    print("  /replay/phase_label     — fase y tiempo actual")
-    print()
-    print("  En RViz2 agrega:")
+    print("\n══════════════════════════════════════════════════════")
+    print("  En RViz2 (Fixed Frame: rtk_odom):")
     print("    Add → By topic → /replay/trajectory      → MarkerArray")
     print("    Add → By topic → /replay/current_pos     → MarkerArray")
     print("    Add → By topic → /replay/static_markers  → MarkerArray")
     print("    Add → By topic → /replay/phase_label     → MarkerArray")
-    print("  Fixed Frame: map")
-    print("══════════════════════════════════════════════════\n")
+    print("══════════════════════════════════════════════════════\n")
 
     try:
         rclpy.spin(node)
