@@ -311,7 +311,7 @@ class LogReplayNode(Node):
                 if remaining > 1e-4:          # solo dormir si vale la pena
                     time.sleep(remaining)
 
-                stamp = _ros_stamp(log_t)
+                stamp = self.get_clock().now().to_msg()
                 self._pub_frame("uav1",
                                 self.lx[i], self.ly[i], self.lz[i],
                                 self.lqx[i], self.lqy[i], self.lqz[i], self.lqw[i],
@@ -351,7 +351,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--master",  default=CSV_FILE)
-    ap.add_argument("--speed",   type=float, default=20.0,
+    ap.add_argument("--speed",   type=float, default=1.0,
                     help="Factor velocidad (1.0=tiempo real, 10.0=x10)")
     ap.add_argument("--loop",    action="store_true")
     ap.add_argument("--no-path", action="store_true")
