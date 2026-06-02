@@ -262,11 +262,10 @@ class LogReplayNode(Node):
         self.idx = 0
         self.t_arr = df["t"].values
 
-        # Timer de reproducción (se ajusta dinámicamente según dt real del log)
-        # Usamos un timer rápido y controlamos el tiempo internamente
         self._replay_active = True
-        self._last_wall     = None
-        self._last_log_t    = None
+        # Origen absoluto: se fija al publicar el primer sample
+        self._wall_origin  = None   # time.monotonic() del primer sample
+        self._log_t_origin = None   # t del log en el primer sample
 
         # Disparar la reproducción en un timer de 10 ms
         self.timer = self.create_timer(0.01, self._step_cb)
@@ -379,17 +378,16 @@ class LogReplayNode(Node):
             return
 
         df   = self.df
-        idx  = self.idx
         n    = len(df)
 
-        if idx >= n:
+        if self.idx >= n:
             if self.loop:
                 self.get_logger().info("[Replay] Reiniciando (--loop)…")
                 self.idx = 0
                 for ns in self.pubs:
                     self.pubs[ns]["path_msg"] = self._empty_path()
-                self._last_wall  = None
-                self._last_log_t = None
+                self._wall_origin  = None
+                self._log_t_origin = None
                 return
             else:
                 self.get_logger().info("[Replay] Fin del log. Ctrl+C para salir.")
@@ -397,56 +395,52 @@ class LogReplayNode(Node):
                 self.timer.cancel()
                 return
 
-        log_t = float(self.t_arr[idx])
-        wall  = time.monotonic()
+        wall = time.monotonic()
 
-        # Control de tiempo real simulado
-        if self.speed > 0:
-            if self._last_wall is not None:
-                dt_log  = log_t - self._last_log_t          # dt en el log
-                dt_wall = wall  - self._last_wall            # dt real transcurrido
-                dt_needed = dt_log / self.speed              # dt que debería haber pasado
+        # Fijar origen en el primer sample
+        if self._wall_origin is None:
+            self._wall_origin  = wall
+            self._log_t_origin = float(self.t_arr[self.idx])
 
-                if dt_wall < dt_needed:
-                    return   # aún no es el momento de publicar este sample
-        # speed == 0: paso a paso — se publica y luego espera el Enter en el main
+        # Publicar todos los samples que ya debieron haberse emitido
+        while self.idx < n:
+            log_t = float(self.t_arr[self.idx])
+            dt_log  = log_t - self._log_t_origin        # tiempo transcurrido en el log
+            dt_wall = time.monotonic() - self._wall_origin  # tiempo real transcurrido
 
-        row = df.iloc[idx]
+            if dt_wall < dt_log / self.speed:
+                break   # aún no toca este sample
 
-        # Extraer posiciones ya transformadas (L_rx, L_ry, L_cz, S_rx, S_ry, S_cz)
-        lx = float(row["L_rx"]) if not np.isnan(row["L_rx"]) else 0.0
-        ly = float(row["L_ry"]) if not np.isnan(row["L_ry"]) else 0.0
-        lz = float(row["L_cz"]) if not np.isnan(row["L_cz"]) else 0.0
-        sx = float(row["S_rx"]) if not np.isnan(row["S_rx"]) else 0.0
-        sy = float(row["S_ry"]) if not np.isnan(row["S_ry"]) else 0.0
-        sz = float(row["S_cz"]) if not np.isnan(row["S_cz"]) else 0.0
+            row = df.iloc[self.idx]
 
-        # Orientación: usar columnas de cuaternión si existen, si no identidad
-        def get_quat(pfx):
-            q = Quaternion()
-            q.w = 1.0
-            for field, col in [("x", f"{pfx}_qx"), ("y", f"{pfx}_qy"),
-                                ("z", f"{pfx}_qz"), ("w", f"{pfx}_qw")]:
-                if col in df.columns and not np.isnan(row[col]):
-                    setattr(q, field, float(row[col]))
-            return q
+            lx = float(row["L_rx"]) if not np.isnan(row["L_rx"]) else 0.0
+            ly = float(row["L_ry"]) if not np.isnan(row["L_ry"]) else 0.0
+            lz = float(row["L_cz"]) if not np.isnan(row["L_cz"]) else 0.0
+            sx = float(row["S_rx"]) if not np.isnan(row["S_rx"]) else 0.0
+            sy = float(row["S_ry"]) if not np.isnan(row["S_ry"]) else 0.0
+            sz = float(row["S_cz"]) if not np.isnan(row["S_cz"]) else 0.0
 
-        stamp = self._ros_now_from_log_t(log_t)
+            def get_quat(pfx):
+                q = Quaternion()
+                q.w = 1.0
+                for field, col in [("x", f"{pfx}_qx"), ("y", f"{pfx}_qy"),
+                                    ("z", f"{pfx}_qz"), ("w", f"{pfx}_qw")]:
+                    if col in df.columns and not np.isnan(row[col]):
+                        setattr(q, field, float(row[col]))
+                return q
 
-        self._publish_drone("uav1", lx, ly, lz, get_quat("L"), stamp)
-        self._publish_drone("uav2", sx, sy, sz, get_quat("S"), stamp)
+            stamp = self._ros_now_from_log_t(log_t)
+            self._publish_drone("uav1", lx, ly, lz, get_quat("L"), stamp)
+            self._publish_drone("uav2", sx, sy, sz, get_quat("S"), stamp)
 
-        self._last_wall  = wall
-        self._last_log_t = log_t
-        self.idx += 1
+            if self.idx % 200 == 0:
+                self.get_logger().info(
+                    f"[Replay] t={log_t:.1f} s  idx={self.idx}/{n}  "
+                    f"fase={row.get('phase','?')}  "
+                    f"L=({lx:.2f},{ly:.2f},{lz:.2f})  S=({sx:.2f},{sy:.2f},{sz:.2f})"
+                )
 
-        # Log de progreso cada 10 s simulados
-        if idx % 200 == 0:
-            self.get_logger().info(
-                f"[Replay] t={log_t:.1f} s  idx={idx}/{n}  "
-                f"fase={row.get('phase','?')}  "
-                f"L=({lx:.2f},{ly:.2f},{lz:.2f})  S=({sx:.2f},{sy:.2f},{sz:.2f})"
-            )
+            self.idx += 1
 
 
 # =============================================================================
@@ -495,6 +489,8 @@ def main():
         try:
             while rclpy.ok() and node._replay_active:
                 input()        # espera Enter
+                node._wall_origin  = None   # reinicia origen para no esperar en paso-a-paso
+                node._log_t_origin = None
                 node._step_cb()
                 rclpy.spin_once(node, timeout_sec=0.01)
         except KeyboardInterrupt:
