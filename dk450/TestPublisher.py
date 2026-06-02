@@ -5,6 +5,20 @@ Corre en tu máquina con ROS 2 activo y un CSV real:
   python3 bench_replay_loop.py --master vuelo1.csv --speed 10.0
 
 Imprime un desglose por sección del loop.
+
+
+Benchmarking 500 iteraciones (2x odom + 2x marker + 2x TF por iter)...
+
+Resultados:
+  Tiempo total:        0.159 s para 500 iters
+  Tiempo por muestra:  0.317 ms
+  Throughput máximo:   3150 muestras/s
+
+Implicaciones:
+  A 10 Hz (log típico): speed máximo alcanzable = 315x
+  A 50 Hz (log rápido): speed máximo alcanzable = 63x
+
+
 """
 import sys
 import time
