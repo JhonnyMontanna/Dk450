@@ -10,6 +10,9 @@ Cambios respecto a v1:
   - Log de CONTROL (`lf_circulo_*.csv`): igual que antes, solo se llena
     cuando el PID está activo. No se modificó ninguna columna ni lógica.
   - El replay de RViz2 se genera a partir del log de trayectoria.
+  - NUEVO: Cálculo de métricas integrales (IAE, ISE, ITAE) para errores
+  - NUEVO: Inversión de ejes en gráficas para visualización estilo Mission Planner
+    (X = Este, Y = Norte)
 
 Secuencia:
   1. Conectar y fijar origen ENU
@@ -22,6 +25,7 @@ Secuencia:
   8. Aterrizaje del LÍDER    (ENTER para confirmar)
   9. Aterrizaje del SEGUIDOR (ENTER para confirmar)
  10. Guardar CSVs y generar replay RViz2
+ 11. Calcular y mostrar métricas integrales (IAE, ISE, ITAE)
 """
 
 import math
@@ -45,6 +49,11 @@ LIVE_PLOT_ENABLED   = True
 LIVE_PLOT_TRAJ_ONLY = True
 LIVE_PLOT_RATE      = 4        # Hz de refresco de la ventana en vivo
 
+# ── Configuración de visualización estilo Mission Planner ─────────────────────
+# Si es True, invierte los ejes para que X = Este, Y = Norte (como Mission Planner)
+# Si es False, mantiene X = Norte, Y = Este (estándar ENU)
+MISSION_PLANNER_STYLE = True
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CONEXIONES Y SYSIDS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -61,8 +70,8 @@ FOLLOWER_COMPID = 1
 # ══════════════════════════════════════════════════════════════════════════════
 # DESPEGUE
 # ══════════════════════════════════════════════════════════════════════════════
-TAKEOFF_ALT_LEADER   = 2.0   # metros AGL
-TAKEOFF_ALT_FOLLOWER = 2.0
+TAKEOFF_ALT_LEADER   = 1.5   # metros AGL
+TAKEOFF_ALT_FOLLOWER = 3.0
 TAKEOFF_TIMEOUT      = 30.0  # segundos máximos esperando altitud
 TAKEOFF_ALT_TOL      = 0.3   # tolerancia [m] para considerar "alcanzó altitud"
 
@@ -104,8 +113,9 @@ def gps_to_enu(lat_deg, lon_deg, alt_m):
     ref_lat = math.radians(_enu_origin['lat'])
     dlat    = math.radians(lat_deg - _enu_origin['lat'])
     dlon    = math.radians(lon_deg - _enu_origin['lon'])
-    x = dlat * R_EARTH
-    y = dlon * R_EARTH * math.cos(ref_lat)
+    # NOTA: En ENU estándar: x = Norte, y = Este
+    x = dlat * R_EARTH          # Norte
+    y = dlon * R_EARTH * math.cos(ref_lat)  # Este
     z = alt_m - _enu_origin['alt']
     return x, y, z
 
@@ -140,25 +150,24 @@ CONV_SPEED   = 0.10
 CONV_HOLD    = 1.0
 CONV_TIMEOUT = 15.0
 
-PREPOS_Z_LEADER   = 3.0
-PREPOS_Z_FOLLOWER = 3.0
+PREPOS_Z_LEADER   = 1.5
+PREPOS_Z_FOLLOWER = 2.0
 PREPOS_TIMEOUT    = 40.0
 PREPOS_CONV_R     = 0.30
 PREPOS_CONV_V     = 0.20
 PREPOS_CONV_HOLD  = 2.0
 
 RETURN_ENABLED = True
-
 RETURN_TIMEOUT = 40.0
 
 FOLLOWER_RATE = 20
 
-OFFSET_D     = 2.0
+OFFSET_D     = 1.0
 OFFSET_ALPHA = -math.pi / 2
 OFFSET_DZ    = 1.0
 
 KP, KI, KD              = 0.5, 0.0, 0.0
-KP_YAW, KI_YAW, KD_YAW = 0.8, 0.0, 0.0
+KP_YAW, KI_YAW, KD_YAW = 0.8, 0.0, 0.1
 
 INTEGRAL_LIMIT     = 2.0
 INTEGRAL_YAW_LIMIT = 1.0
@@ -225,10 +234,24 @@ _LOG_COLS = [
 ]
 _log = {k: [] for k in _LOG_COLS}
 
+# ── Métricas integrales (IAE, ISE, ITAE) ──────────────────────────────────────
+# Se acumulan durante el vuelo y se reportan al final
+_integral_metrics = {
+    # Para cada variable: {'iae': 0.0, 'ise': 0.0, 'itae': 0.0, 't_start': None, 'last_t': 0.0}
+    'ex': {'iae': 0.0, 'ise': 0.0, 'itae': 0.0},
+    'ey': {'iae': 0.0, 'ise': 0.0, 'itae': 0.0},
+    'ez': {'iae': 0.0, 'ise': 0.0, 'itae': 0.0},
+    'e_yaw': {'iae': 0.0, 'ise': 0.0, 'itae': 0.0},
+    'err_xy': {'iae': 0.0, 'ise': 0.0, 'itae': 0.0},
+    'dist_err': {'iae': 0.0, 'ise': 0.0, 'itae': 0.0},  # |dist_xy - OFFSET_D|
+}
+_metrics_lock = threading.Lock()
+_metrics_t_start = None  # tiempo de inicio de acumulación (cuando empieza el PID)
+
 # ── Log de TRAYECTORIA (desde el inicio del programa, para RViz2) ─────────────
 # Columnas: tiempo, fase, posición y yaw de ambos drones
 _TRAJ_COLS = [
-    'timestamp_unix', 't', 'phase',
+    'timestamp_unix', 't', 'phase', 'event',
     'lx', 'ly', 'lz', 'l_yaw',
     'sx', 'sy', 'sz', 's_yaw',
 ]
@@ -237,10 +260,118 @@ _traj_lock     = threading.Lock()
 _traj_timer    = None   # threading.Timer periódico
 _traj_t0       = None   # tiempo de referencia del programa completo
 _traj_phase    = 'init' # fase actual: init, takeoff_L, takeoff_S, prepos, circle, return, land_L, land_S
+_traj_event    = ''     # evento puntual; se consume tras ser escrito una vez
+
+def log_event(name: str):
+    """Registra un evento puntual en la próxima fila del log de trayectoria."""
+    global _traj_event
+    with _traj_lock:
+        _traj_event = name
+    print(f"  [EVENT] {name}")
 
 _circle_done  = threading.Event()
 _stop_all     = threading.Event()
 _leader_phase = 'circle'   # para el log de control
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FUNCIONES PARA MÉTRICAS INTEGRALES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _update_integral_metrics(t, ex, ey, ez, e_yaw, err_xy, dist_xy):
+    """
+    Actualiza las métricas integrales IAE, ISE, ITAE.
+    Se llama en cada iteración del PID.
+    """
+    global _metrics_t_start
+    with _metrics_lock:
+        if _metrics_t_start is None:
+            _metrics_t_start = t
+            return
+        
+        dt = t - _integral_metrics.get('last_t', t)
+        if dt <= 0:
+            return
+        
+        # Error de distancia de formación
+        dist_err = abs(dist_xy - OFFSET_D)
+        
+        # Para cada variable: IAE = ∫|e| dt, ISE = ∫e² dt, ITAE = ∫ t·|e| dt
+        metrics_map = {
+            'ex': abs(ex),
+            'ey': abs(ey),
+            'ez': abs(ez),
+            'e_yaw': abs(e_yaw),
+            'err_xy': err_xy,
+            'dist_err': dist_err,
+        }
+        
+        for key, abs_err in metrics_map.items():
+            _integral_metrics[key]['iae'] += abs_err * dt
+            _integral_metrics[key]['ise'] += (abs_err ** 2) * dt
+            _integral_metrics[key]['itae'] += t * abs_err * dt
+        
+        _integral_metrics['last_t'] = t
+
+
+def reset_integral_metrics():
+    """Reinicia las métricas integrales (llamar al inicio del PID)."""
+    global _metrics_t_start
+    with _metrics_lock:
+        for key in _integral_metrics:
+            if key != 'last_t':
+                _integral_metrics[key]['iae'] = 0.0
+                _integral_metrics[key]['ise'] = 0.0
+                _integral_metrics[key]['itae'] = 0.0
+        _integral_metrics['last_t'] = 0.0
+        _metrics_t_start = None
+
+
+def print_integral_metrics():
+    """Imprime y guarda las métricas integrales calculadas."""
+    with _metrics_lock:
+        if _metrics_t_start is None:
+            print("\n⚠️  No hay métricas integrales para mostrar.")
+            return
+        
+        duration = _integral_metrics['last_t'] - _metrics_t_start
+        
+        print('\n' + '='*70)
+        print('  MÉTRICAS INTEGRALES DE ERROR (fase círculo)')
+        print('='*70)
+        print(f'  Duración del segmento: {duration:.2f} s')
+        print('-'*70)
+        print(f'  {"Variable":<12} {"IAE":>12} {"ISE":>12} {"ITAE":>12}')
+        print(f'  {"":<12} {"[m·s]":>12} {"[m²·s]":>12} {"[m·s²]":>12}')
+        print('-'*70)
+        
+        for var, units in [('ex', 'm'), ('ey', 'm'), ('ez', 'm'), 
+                           ('e_yaw', 'rad'), ('err_xy', 'm'), 
+                           ('dist_err', 'm')]:
+            iae = _integral_metrics[var]['iae']
+            ise = _integral_metrics[var]['ise']
+            itae = _integral_metrics[var]['itae']
+            print(f'  {var:<12} {iae:>12.4f} {ise:>12.4f} {itae:>12.4f}')
+        
+        print('-'*70)
+        print('\n  Interpretación:')
+        print('  • IAE (Integral Absolute Error) → sensibilidad a errores sostenidos')
+        print('  • ISE (Integral Square Error)   → penaliza errores grandes')
+        print('  • ITAE (Integral Time Absolute Error) → enfatiza errores al final')
+        print('='*70 + '\n')
+        
+        # Guardar métricas en archivo
+        metrics_fname = f'lf_metrics_{int(time.time())}.csv'
+        with open(metrics_fname, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['variable', 'iae', 'ise', 'itae', 'duration_s'])
+            for var in ['ex', 'ey', 'ez', 'e_yaw', 'err_xy', 'dist_err']:
+                w.writerow([var, 
+                           f"{_integral_metrics[var]['iae']:.6f}",
+                           f"{_integral_metrics[var]['ise']:.6f}",
+                           f"{_integral_metrics[var]['itae']:.6f}"])
+            w.writerow(['duration', '', '', '', f"{duration:.3f}"])
+        print(f"📊 Métricas integrales guardadas en: {metrics_fname}")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LOG DE TRAYECTORIA — grabación periódica desde inicio
@@ -260,19 +391,26 @@ def _traj_tick():
         phase = _traj_phase
 
     # Solo registrar si tenemos al menos posición x,y,z de ambos
-    lx  = L.get('x')  or 0.0
-    ly  = L.get('y')  or 0.0
+    lx  = L.get('x')  or 0.0  # Norte
+    ly  = L.get('y')  or 0.0  # Este
     lz  = L.get('z')  or 0.0
     lyw = L.get('yaw') or 0.0
-    sx  = S.get('x')  or 0.0
-    sy  = S.get('y')  or 0.0
+    sx  = S.get('x')  or 0.0  # Norte
+    sy  = S.get('y')  or 0.0  # Este
     sz  = S.get('z')  or 0.0
     syw = S.get('yaw') or 0.0
+
+    # Consumir evento puntual (se escribe una sola vez y luego se limpia)
+    global _traj_event
+    with _traj_lock:
+        event         = _traj_event
+        _traj_event   = ''
 
     row = {
         'timestamp_unix': f'{ts_unix:.6f}',
         't':     f'{t_rel:.4f}',
         'phase': phase,
+        'event': event,
         'lx':    f'{lx:.4f}',  'ly':    f'{ly:.4f}',  'lz':    f'{lz:.4f}',
         'l_yaw': f'{lyw:.4f}',
         'sx':    f'{sx:.4f}',  'sy':    f'{sy:.4f}',  'sz':    f'{sz:.4f}',
@@ -365,10 +503,32 @@ def state_ready(s):
                for k in ['x', 'y', 'z', 'vx', 'vy', 'vz', 'yaw', 'yaw_rate'])
 
 # ══════════════════════════════════════════════════════════════════════════════
+# UTILIDAD — PROMPT CON OPCIÓN DE SALTAR
+# ══════════════════════════════════════════════════════════════════════════════
+def _prompt(msg: str) -> bool:
+    """
+    Muestra `msg` y espera input del usuario.
+    Retorna True  → continuar (ENTER o cualquier tecla excepto 's'/'S')
+    Retorna False → saltar    ('s' o 'S')
+    """
+    print(f"\n  {msg}")
+    print("  [ENTER = continuar  |  s = saltar esta fase]")
+    try:
+        resp = input("  > ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return True
+    skipped = resp == 's'
+    if skipped:
+        print("  ⏭️  Fase saltada por el usuario.")
+    return not skipped   # True = continuar, False = saltar
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # DESPEGUE
 # ══════════════════════════════════════════════════════════════════════════════
+
 def _set_mode_guided(master, sysid, compid, label=''):
-    """Envía MAV_CMD_DO_SET_MODE para GUIDED (mode=4 en ArduCopter)."""
+    """Cambia a modo GUIDED. Llamar DESPUÉS de armar."""
     master.mav.command_long_send(
         sysid, compid,
         mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
@@ -376,11 +536,16 @@ def _set_mode_guided(master, sysid, compid, label=''):
         4, 0, 0, 0, 0, 0
     )
     time.sleep(1.0)
-    print(f"  [{label}] Modo GUIDED enviado.")
+    print(f"  [{label}] Modo GUIDED activado.")
 
 
 def _arm(master, sysid, compid, label=''):
-    """Arma los motores y espera confirmación."""
+    """
+    Arma los motores SIN cambiar de modo (el dron ya debe estar en GUIDED
+    o en el modo que permita armar). Espera confirmación por HEARTBEAT.
+    Nota: cambiar a GUIDED antes de armar causa error en ArduCopter real;
+    el modo debe configurarse desde la GCS o estar preconfigurado.
+    """
     master.mav.command_long_send(
         sysid, compid,
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
@@ -394,7 +559,7 @@ def _arm(master, sysid, compid, label=''):
             print(" ✅ armado")
             return True
         print('.', end='', flush=True)
-    print(" ⚠️  no se confirmó armado")
+    print(" ⚠️  no se confirmó armado (continuando)")
     return False
 
 
@@ -417,6 +582,7 @@ def _wait_altitude(get_state_fn, target_alt, tol, timeout, label=''):
         z = s.get('z')
         if z is not None and abs(z - target_alt) < tol:
             print(f"  [{label}] ✅ Altitud alcanzada: {z:.2f} m")
+            log_event(f'takeoff_{label.lower().replace(" ","_")}_done')
             return True
         time.sleep(0.3)
     print(f"  [{label}] ⚠️  Timeout esperando altitud")
@@ -425,18 +591,18 @@ def _wait_altitude(get_state_fn, target_alt, tol, timeout, label=''):
 
 def do_takeoff(master, sysid, compid, get_state_fn, alt, label):
     """
-    Secuencia completa de despegue para un dron:
-      GUIDED → ARM → TAKEOFF → esperar altitud.
+    Secuencia de despegue para ArduCopter en Stabilize:
+      ARM (en Stabilize) → GUIDED → TAKEOFF → esperar altitud.
     """
     print(f"\n{'─'*60}")
     print(f"  DESPEGUE — {label}")
     print(f"{'─'*60}")
-    _set_mode_guided(master, sysid, compid, label)
-    ok = _arm(master, sysid, compid, label)
-    if not ok:
-        print(f"  [{label}] ⚠️  Continuando igualmente (simulador puede no confirmar).")
+    log_event(f'takeoff_{label.lower().replace(" ","_")}_arm')
+    _arm(master, sysid, compid, label)          # arma en Stabilize
+    _set_mode_guided(master, sysid, compid, label)  # cambia a GUIDED ya armado
     _send_takeoff(master, sysid, compid, alt, label)
     _wait_altitude(get_state_fn, alt, TAKEOFF_ALT_TOL, TAKEOFF_TIMEOUT, label)
+
 
 def do_land(master, sysid, compid, get_state_fn, label):
     """
@@ -458,6 +624,7 @@ def do_land(master, sysid, compid, get_state_fn, label):
         z = s.get('z')
         if z is not None and z < 0.15:
             print(f"  [{label}] ✅ En tierra (z={z:.2f} m)")
+            log_event(f'land_{label.lower().replace(" ","_")}_done')
             return True
         time.sleep(0.5)
     print(f"  [{label}] ⚠️  Timeout esperando aterrizaje")
@@ -572,12 +739,74 @@ def compute_control(L, S, pid, dt):
         e_yaw=e_yaw,
     )
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOG DE PREPOSICIONAMIENTO — error vs tiempo por eje
+# ══════════════════════════════════════════════════════════════════════════════
+_PREPOS_LOG_COLS = [
+    'timestamp_unix', 't', 'drone', 'label',
+    'tx', 'ty', 'tz',           # objetivo
+    'x',  'y',  'z',            # posición actual
+    'ex', 'ey', 'ez',           # error por eje
+    'dist_xy', 'dist_z',        # distancia horizontal y vertical
+    'speed',                    # velocidad horizontal
+    'in_zone',                  # 1 si cumple criterio de convergencia, 0 si no
+]
+_prepos_log      = {k: [] for k in _PREPOS_LOG_COLS}
+_prepos_log_lock = threading.Lock()
+_prepos_t0       = None   # se fija al inicio del primer wp de prepos
+
+def _prepos_log_row(drone, label, tx, ty, tz, s, conv_r, conv_v, t0_ref):
+    """Escribe una fila en el log de preposicionamiento."""
+    ts_unix = time.time()
+    t_rel   = time.monotonic() - t0_ref
+    x  = s.get('x',  0.0)
+    y  = s.get('y',  0.0)
+    z  = s.get('z',  0.0)
+    ex = tx - x
+    ey = ty - y
+    ez = tz - z
+    dist_xy = math.hypot(ex, ey)
+    dist_z  = abs(ez)
+    speed   = math.hypot(s.get('vx', 0.0), s.get('vy', 0.0))
+    in_zone = 1 if (dist_xy < conv_r and dist_z < conv_r * 2 and speed < conv_v) else 0
+    row = {
+        'timestamp_unix': f'{ts_unix:.6f}',
+        't':       f'{t_rel:.4f}',
+        'drone':    drone,
+        'label':    label,
+        'tx':      f'{tx:.4f}', 'ty': f'{ty:.4f}', 'tz': f'{tz:.4f}',
+        'x':       f'{x:.4f}',  'y':  f'{y:.4f}',  'z':  f'{z:.4f}',
+        'ex':      f'{ex:.4f}', 'ey': f'{ey:.4f}', 'ez': f'{ez:.4f}',
+        'dist_xy': f'{dist_xy:.4f}',
+        'dist_z':  f'{dist_z:.4f}',
+        'speed':   f'{speed:.4f}',
+        'in_zone':  str(in_zone),
+    }
+    with _prepos_log_lock:
+        for k in _PREPOS_LOG_COLS:
+            _prepos_log[k].append(row[k])
+
+def save_prepos_csv() -> str:
+    fname = f'lf_prepos_{int(time.time())}.csv'
+    with _prepos_log_lock:
+        if not _prepos_log['t']:
+            print("  (Sin datos de preposicionamiento para guardar)")
+            return ''
+        rows = list(zip(*[_prepos_log[k] for k in _PREPOS_LOG_COLS]))
+    with open(fname, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(_PREPOS_LOG_COLS)
+        w.writerows(rows)
+    print(f"📐 Prepos CSV: {fname}  ({len(rows)} muestras)")
+    return fname
+
 # ══════════════════════════════════════════════════════════════════════════════
 # UTILIDAD — WAYPOINT
 # ══════════════════════════════════════════════════════════════════════════════
 def _fly_to_wp(master, sysid, compid, tx, ty, tz_agl, get_state_fn,
                label='', conv_r=None, conv_v=None, conv_hold=None,
-               timeout=None, rate=20):
+               timeout=None, rate=20, drone_id='', log_prepos=False):
     conv_r    = conv_r    or PREPOS_CONV_R
     conv_v    = conv_v    or PREPOS_CONV_V
     conv_hold = conv_hold or PREPOS_CONV_HOLD
@@ -599,7 +828,10 @@ def _fly_to_wp(master, sysid, compid, tx, ty, tz_agl, get_state_fn,
         dist   = math.hypot(s['x'] - tx, s['y'] - ty)
         dist_z = abs(s['z'] - tz_agl)
         speed  = math.hypot(s['vx'], s['vy'])
-        if dist < conv_r and dist_z < conv_r * 2 and speed < conv_v:
+        in_zone = dist < conv_r and dist_z < conv_r * 2 and speed < conv_v
+        if log_prepos:
+            _prepos_log_row(drone_id, label, tx, ty, tz_agl, s, conv_r, conv_v, t0)
+        if in_zone:
             if t_in_zone is None:
                 t_in_zone = now
             elif now - t_in_zone >= conv_hold:
@@ -636,13 +868,17 @@ def preposition(master_leader, master_follower):
     set_traj_phase('prepos')
 
     print(f"\n  Turno 1/2 — SEGUIDOR moviéndose...")
+    log_event('prepos_follower_start')
     ok_s = _fly_to_wp(master_follower, FOLLOWER_SYSID, FOLLOWER_COMPID,
-                      S_x, S_y, S_z, get_follower, label='SEGUIDOR prepos')
+                      S_x, S_y, S_z, get_follower, label='SEGUIDOR prepos',
+                      drone_id='follower', log_prepos=True)
     if not ok_s:
         print("  ⚠️  Seguidor no convergió.")
-    input("  ENTER para mover el LÍDER...\n")
+    log_event('prepos_follower_done')
+    _prompt("Mover el LÍDER a su posición de preposicionamiento")
 
     print(f"  Turno 2/2 — LÍDER moviéndose...")
+    log_event('prepos_leader_start')
     dt        = 1.0 / 20
     t0        = time.monotonic()
     t_in_zone = None
@@ -658,6 +894,8 @@ def preposition(master_leader, master_follower):
         dist   = math.hypot(L['x'] - L_x, L['y'] - L_y)
         dist_z = abs(L['z'] - L_z)
         speed  = math.hypot(L['vx'], L['vy'])
+        _prepos_log_row('leader', 'LIDER prepos', L_x, L_y, L_z, L,
+                        PREPOS_CONV_R, PREPOS_CONV_V, t0)
         if dist < PREPOS_CONV_R and dist_z < PREPOS_CONV_R * 2 and speed < PREPOS_CONV_V:
             if t_in_zone is None:
                 t_in_zone = time.monotonic()
@@ -684,12 +922,18 @@ def return_to_start(master_leader, master_follower, L_x, L_y, L_z, S_x, S_y, S_z
     print(f"\n{'─'*65}")
     print(f"  REGRESO AL ORIGEN"); print(f"{'─'*65}")
     set_traj_phase('return')
+    log_event('return_leader_start')
     print(f"  Turno 1/2 — LÍDER regresando...")
     _fly_to_wp(master_leader, LEADER_SYSID, LEADER_COMPID,
-               L_x, L_y, L_z, get_leader, label='LIDER regreso', timeout=RETURN_TIMEOUT)
+               L_x, L_y, L_z, get_leader, label='LIDER regreso', timeout=RETURN_TIMEOUT,
+               drone_id='leader', log_prepos=True)
+    log_event('return_leader_done')
+    log_event('return_follower_start')
     print(f"  Turno 2/2 — SEGUIDOR regresando...")
     _fly_to_wp(master_follower, FOLLOWER_SYSID, FOLLOWER_COMPID,
-               S_x, S_y, S_z, get_follower, label='SEGUIDOR regreso', timeout=RETURN_TIMEOUT)
+               S_x, S_y, S_z, get_follower, label='SEGUIDOR regreso', timeout=RETURN_TIMEOUT,
+               drone_id='follower', log_prepos=True)
+    log_event('return_follower_done')
     print(f"  Regreso completado.")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -714,6 +958,7 @@ def _thread_circle(master_leader, leader_sp_q):
     next_t = time.monotonic()
     _leader_phase = 'circle'
     set_traj_phase('circle')
+    log_event('circle_start')
     x_sp = cx + RADIUS * math.cos(theta0)
     y_sp = cy + RADIUS * math.sin(theta0)
     yaw  = theta0 + math.pi / 2
@@ -760,19 +1005,22 @@ def _thread_circle(master_leader, leader_sp_q):
                 t_in_zone = None
         time.sleep(dt)
 
+    log_event('circle_done')
     _circle_done.set()
     print("[LÍDER] 🏁 Trayectoria finalizada.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HILO B — PID DEL SEGUIDOR (igual que v1, log de control intacto)
+# HILO B — PID DEL SEGUIDOR (con cálculo de métricas integrales)
 # ══════════════════════════════════════════════════════════════════════════════
 def _thread_pid(master_follower, start_time_ref, leader_sp_q):
     """
-    Log de control: idéntico a v1.
-    Solo se llena cuando el PID está activo (durante el círculo).
+    Log de control: idéntico a v1, pero además calcula métricas integrales.
     """
     dt  = 1.0 / FOLLOWER_RATE
     pid = PIDState()
+
+    # Reiniciar métricas integrales al empezar el PID
+    reset_integral_metrics()
 
     print("[SEGUIDOR] Esperando telemetría...", end='', flush=True)
     while True:
@@ -782,6 +1030,7 @@ def _thread_pid(master_follower, start_time_ref, leader_sp_q):
     print(" ✅")
 
     next_t = time.monotonic()
+    last_t = 0.0
 
     while not _stop_all.is_set():
         L = get_leader()
@@ -797,6 +1046,10 @@ def _thread_pid(master_follower, start_time_ref, leader_sp_q):
             dist_xy = math.hypot(L['x'] - S['x'], L['y'] - S['y'])
             dist_z  = abs(L['z'] - S['z'])
             err_xy  = math.hypot(c['ex'], c['ey'])
+
+            # Actualizar métricas integrales (IAE, ISE, ITAE)
+            _update_integral_metrics(t_el, c['ex'], c['ey'], c['ez'], 
+                                     c['e_yaw'], err_xy, dist_xy)
 
             with _lock:
                 lxsp = leader_sp_q.get('x_sp', L['x'])
@@ -1066,18 +1319,29 @@ if __name__ == "__main__":
     return replay_fname
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LIVE PLOT (igual que v1)
+# LIVE PLOT (con soporte para estilo Mission Planner)
 # ══════════════════════════════════════════════════════════════════════════════
+
 def _init_live_plot_traj():
     plt.ion()
     fig, ax = plt.subplots(figsize=(7, 7))
-    fig.suptitle('Trayectoria XY — Tiempo Real', fontsize=12)
-    ax.set_xlabel('X [m]'); ax.set_ylabel('Y [m]')
-    ax.set_aspect('equal'); ax.grid(True, alpha=0.4)
-    ln_th, = ax.plot([], [], 'k:', lw=1,   label='Teórico')
-    ln_L,  = ax.plot([], [], 'g-', lw=2,   label='Líder')
-    ln_sp, = ax.plot([], [], 'r--',lw=1.2, label='Setpoint S', alpha=0.7)
-    ln_S,  = ax.plot([], [], 'b-', lw=2,   label='Seguidor')
+    
+    if MISSION_PLANNER_STYLE:
+        fig.suptitle('Trayectoria XY — Tiempo Real (Estilo Mission Planner)', fontsize=12)
+        ax.set_xlabel('x [m]', fontsize=11)
+        ax.set_ylabel('y [m]', fontsize=11)
+    else:
+        fig.suptitle('Trayectoria XY — Tiempo Real (Estilo ENU)', fontsize=12)
+        ax.set_xlabel('Norte [m]', fontsize=11)
+        ax.set_ylabel('Este [m]', fontsize=11)
+    
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.4)
+    
+    ln_th, = ax.plot([], [], 'k:', lw=1, label='Teórico')
+    ln_L,  = ax.plot([], [], 'g-', lw=2, label='Líder')
+    ln_sp, = ax.plot([], [], 'r--', lw=1.2, label='Setpoint S', alpha=0.7)
+    ln_S,  = ax.plot([], [], 'b-', lw=2, label='Seguidor')
     ax.legend(fontsize=8, loc='upper right')
     lines = dict(xy_th=ln_th, xy_L=ln_L, xy_sp=ln_sp, xy_S=ln_S)
     axes  = dict(xy=ax)
@@ -1087,7 +1351,12 @@ def _init_live_plot_traj():
 def _init_live_plot_full():
     plt.ion()
     fig = plt.figure(figsize=(16, 11))
-    fig.suptitle('Control Líder-Seguidor — Tiempo Real', fontsize=12)
+    
+    if MISSION_PLANNER_STYLE:
+        fig.suptitle('Control Líder-Seguidor — Tiempo Real (Estilo Mission Planner)', fontsize=12)
+    else:
+        fig.suptitle('Control Líder-Seguidor — Tiempo Real (Estilo ENU)', fontsize=12)
+    
     gs = fig.add_gridspec(6, 2, hspace=0.55, wspace=0.35)
     ax_xy  = fig.add_subplot(gs[:, 0])
     ax_x   = fig.add_subplot(gs[0, 1])
@@ -1097,9 +1366,18 @@ def _init_live_plot_full():
     ax_px  = fig.add_subplot(gs[4, 1], sharex=ax_x)
     ax_py  = fig.add_subplot(gs[5, 1], sharex=ax_x)
 
-    ax_xy.set_title('Trayectoria XY')
-    ax_xy.set_xlabel('X [m]'); ax_xy.set_ylabel('Y [m]')
-    ax_xy.set_aspect('equal'); ax_xy.grid(True, alpha=0.4)
+    if MISSION_PLANNER_STYLE:
+        ax_xy.set_title('Trayectoria XY')
+        ax_xy.set_xlabel('x [m]')
+        ax_xy.set_ylabel('y [m]')
+    else:
+        ax_xy.set_title('Trayectoria XY (Norte vs Este)')
+        ax_xy.set_xlabel('Norte [m]')
+        ax_xy.set_ylabel('Este [m]')
+    
+    ax_xy.set_aspect('equal')
+    ax_xy.grid(True, alpha=0.4)
+    
     ln_xy_th, = ax_xy.plot([], [], 'k:', lw=1,   label='Teórico')
     ln_xy_L,  = ax_xy.plot([], [], 'g-', lw=2,   label='Líder')
     ln_xy_sp, = ax_xy.plot([], [], 'r--',lw=1.2, label='Setpoint S', alpha=0.7)
@@ -1184,11 +1462,27 @@ def _update_live_plot(fig, axes, lines, traj_only=False):
             vx_c = np.array([float(v) for v in _log['vx_cmd']])
             vy_c = np.array([float(v) for v in _log['vy_cmd']])
 
-    th = np.linspace(0, 2 * math.pi, 300)
-    lines['xy_th'].set_data(RADIUS * np.sin(th), RADIUS * np.cos(th))
-    lines['xy_L'].set_data(ly, lx)
-    lines['xy_sp'].set_data(yd, xd)
-    lines['xy_S'].set_data(sy, sx)
+    # Transformar coordenadas para estilo Mission Planner si es necesario
+    if MISSION_PLANNER_STYLE:
+        lx_plot, ly_plot = ly, lx      # X = Este, Y = Norte
+        sx_plot, sy_plot = sy, sx
+        xd_plot, yd_plot = yd, xd
+        # Círculo teórico: intercambiar seno y coseno
+        th = np.linspace(0, 2 * math.pi, 300)
+        circ_x = RADIUS * np.sin(th)   # Este
+        circ_y = RADIUS * np.cos(th)   # Norte
+    else:
+        lx_plot, ly_plot = lx, ly
+        sx_plot, sy_plot = sx, sy
+        xd_plot, yd_plot = xd, yd
+        th = np.linspace(0, 2 * math.pi, 300)
+        circ_x = RADIUS * np.cos(th)
+        circ_y = RADIUS * np.sin(th)
+    
+    lines['xy_th'].set_data(circ_x, circ_y)
+    lines['xy_L'].set_data(lx_plot, ly_plot)
+    lines['xy_sp'].set_data(xd_plot, yd_plot)
+    lines['xy_S'].set_data(sx_plot, sy_plot)
 
     if not traj_only:
         for ln_l, ln_sp, ln_s, dl, dd, ds in [
@@ -1209,7 +1503,7 @@ def _update_live_plot(fig, axes, lines, traj_only=False):
     fig.canvas.flush_events()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GRÁFICAS POST-VUELO (igual que v1, sin cambios)
+# GRÁFICAS POST-VUELO (con estilo Mission Planner)
 # ══════════════════════════════════════════════════════════════════════════════
 C_refL = np.array([0.40, 0.65, 1.00])
 C_refS = np.array([1.00, 0.60, 0.40])
@@ -1226,40 +1520,55 @@ def _wrap_np(arr):
     return np.arctan2(np.sin(arr), np.cos(arr))
 
 
-# yaw MAVLink: 0=Norte, π/2=Este (sentido horario desde arriba)
-# En el plot: horizontal=Este=sin(yaw_mav), vertical=Norte=cos(yaw_mav)
-
-def _draw_drone_frame(ax, x_plot, y_plot, yaw_mav, scale=SC_DRONE, lw=1.2):
+def _draw_drone_frame(ax, x, y, yaw, scale=SC_DRONE):
     """
-    x_plot, y_plot : coordenadas en el plot (Este, Norte)
-    yaw_mav        : yaw MAVLink (0=Norte, crece Este, radianes)
+    Dibuja el marco del dron.
+    Para Mission Planner: las flechas deben apuntar correctamente.
+    yaw: 0° = Norte, 90° = Este
+    En la visualización: x = Este, y = Norte
     """
-    # Frente del drone en coordenadas del plot
-    dx_front = scale * np.sin(yaw_mav)   # componente Este (horizontal)
-    dy_front = scale * np.cos(yaw_mav)   # componente Norte (vertical)
-    # Lateral izquierdo = frente rotado +90° en ENU
-    dx_left  = scale * np.sin(yaw_mav + np.pi/2)
-    dy_left  = scale * np.cos(yaw_mav + np.pi/2)
-
     kw = dict(angles='xy', scale_units='xy', scale=1,
               width=0.005, headwidth=4, headlength=3.5, headaxislength=3, alpha=0.85)
-    ax.quiver(x_plot, y_plot, dx_front, dy_front,
-              color=[0.85, 0.10, 0.10], **kw)   # rojo = frente
-    ax.quiver(x_plot, y_plot, dx_left,  dy_left,
-              color=[0.10, 0.65, 0.10], **kw)   # verde = lateral izq
+    
+    if MISSION_PLANNER_STYLE:
+        # Flecha roja: frente (dirección del yaw) - componentes intercambiadas
+        ax.quiver(x, y,  scale * np.sin(yaw),           scale * np.cos(yaw),
+                  color=[0.85, 0.10, 0.10], **kw)
+        # Flecha verde: lateral derecho (yaw + 90°) - componentes intercambiadas
+        ax.quiver(x, y,  scale * np.sin(yaw + np.pi/2), scale * np.cos(yaw + np.pi/2),
+                  color=[0.10, 0.65, 0.10], **kw)
+    else:
+        # Estilo ENU estándar
+        ax.quiver(x, y,  scale * np.cos(yaw),           scale * np.sin(yaw),
+                  color=[0.85, 0.10, 0.10], **kw)
+        ax.quiver(x, y,  scale * np.cos(yaw + np.pi/2), scale * np.sin(yaw + np.pi/2),
+                  color=[0.10, 0.65, 0.10], **kw)
+
 
 def _draw_rtk_frame(ax, scale=SC_RTK):
+    """Dibuja el marco de coordenadas de referencia en el origen."""
     kw = dict(angles='xy', scale_units='xy', scale=1,
               width=0.007, headwidth=4, headlength=4, headaxislength=3.5, alpha=0.9)
-    ax.quiver(0, 0, scale, 0, color=[0.85, 0.10, 0.10], **kw)
-    ax.quiver(0, 0, 0, scale, color=[0.10, 0.65, 0.10], **kw)
-    ax.plot(0, 0, 'ok', ms=6, zorder=5)
-    ax.text(scale+0.12, -0.10, r'$\hat{x}_{ENU}$', fontsize=10, fontweight='bold', va='top')
-    ax.text(-0.10, scale+0.10, r'$\hat{y}_{ENU}$', fontsize=10, fontweight='bold', ha='right')
+    
+    if MISSION_PLANNER_STYLE:
+        # Eje X (horizontal) apunta a la derecha (Este)
+        ax.quiver(0, 0, scale, 0, color=[0.10, 0.65, 0.10], **kw)  # Verde → Este
+        # Eje Y (vertical) apunta arriba (Norte)
+        ax.quiver(0, 0, 0, scale, color=[0.85, 0.10, 0.10], **kw)  # Rojo → Norte
+        ax.plot(0, 0, 'ok', ms=6, zorder=5)
+        ax.text(scale + 0.12, -0.10, 'x (Este)', fontsize=10, fontweight='bold', va='top')
+        ax.text(-0.10, scale + 0.10, 'y (Norte)', fontsize=10, fontweight='bold', ha='right')
+    else:
+        # Estilo ENU estándar: x = Norte, y = Este
+        ax.quiver(0, 0, scale, 0, color=[0.85, 0.10, 0.10], **kw)  # Rojo → Norte
+        ax.quiver(0, 0, 0, scale, color=[0.10, 0.65, 0.10], **kw)  # Verde → Este
+        ax.plot(0, 0, 'ok', ms=6, zorder=5)
+        ax.text(scale + 0.12, -0.10, r'Norte', fontsize=10, fontweight='bold', va='top')
+        ax.text(-0.10, scale + 0.10, r'Este', fontsize=10, fontweight='bold', ha='right')
 
 
 def plot_results():
-    """Gráficas post-vuelo usando el log de CONTROL (igual que v1)."""
+    """Gráficas post-vuelo con soporte para estilo Mission Planner."""
     def arr(key): return np.array([float(v) for v in _log[key]])
 
     with _log_lock:
@@ -1299,169 +1608,185 @@ def plot_results():
     print(f'  Error formación RMS: {rms(dist_xy - OFFSET_D):.4f} m')
     print('='*50 + '\n')
 
-    ###
-
-    # ── Después de las métricas existentes, antes de plt.ioff() ──────────────────
-
-    # Paso de tiempo (no uniforme en general, usamos diferencias)
-    dt_arr = np.diff(t, prepend=t[0])   # Δt en cada muestra
-
-
-
-    # IAE por eje
-    iae_x   = np.trapezoid(np.abs(ex),  t)
-    iae_y   = np.trapezoid(np.abs(ey),  t)
-    iae_z   = np.trapezoid(np.abs(ez),  t)
-    iae_xy  = np.trapezoid(np.hypot(ex, ey), t)
-    iae_yaw = np.trapezoid(np.abs(e_yaw), t)
-
-
-
-    # IAE acumulado en el tiempo (para graficar evolución)
-    iae_x_cum  = np.cumsum(np.abs(ex)  * dt_arr)
-    iae_y_cum  = np.cumsum(np.abs(ey)  * dt_arr)
-    iae_z_cum  = np.cumsum(np.abs(ez)  * dt_arr)
-    iae_xy_cum = np.cumsum(np.hypot(ex, ey) * dt_arr)
-
-    # IAE de error de formación (distancia real vs deseada)
-    iae_form     = np.trapezoid(np.abs(dist_xy - OFFSET_D), t)
-    iae_form_cum = np.cumsum(np.abs(dist_xy - OFFSET_D) * dt_arr)
-
-    # Imprimir
-    print(f'  IAE error x        : {iae_x:.4f} m·s')
-    print(f'  IAE error y        : {iae_y:.4f} m·s')
-    print(f'  IAE error z        : {iae_z:.4f} m·s')
-    print(f'  IAE error XY plano : {iae_xy:.4f} m·s')
-    print(f'  IAE error formación: {iae_form:.4f} m·s')
-    print(f'  IAE error yaw      : {iae_yaw:.4f} rad·s')
-
-
-    # ── Fig N — IAE acumulado ────────────────────────────────────────────────────
-    figN, axsN = plt.subplots(3, 1, figsize=(11, 8), sharex=True, facecolor='white')
-    figN.suptitle('IAE Acumulado del Seguidor — fase círculo',
-                fontsize=13, fontweight='bold')
-
-    axsN[0].plot(t, iae_x_cum,  '-', color=C_S,    lw=LW, label=f'IAE x  = {iae_x:.3f} m·s')
-    axsN[0].plot(t, iae_y_cum,  '-', color=C_L,    lw=LW, label=f'IAE y  = {iae_y:.3f} m·s')
-    axsN[0].plot(t, iae_z_cum,  '-', color=C_dist, lw=LW, label=f'IAE z  = {iae_z:.3f} m·s')
-    axsN[0].set_ylabel('IAE [m·s]')
-    axsN[0].legend(fontsize=9); axsN[0].grid(True, alpha=0.3)
-    axsN[0].set_title('IAE por eje (x, y, z)')
-
-    axsN[1].plot(t, iae_xy_cum, '-', color=[0.5, 0.1, 0.7], lw=LW,
-                label=f'IAE XY = {iae_xy:.3f} m·s')
-    axsN[1].set_ylabel('IAE [m·s]')
-    axsN[1].legend(fontsize=9); axsN[1].grid(True, alpha=0.3)
-    axsN[1].set_title('IAE error planar euclidiano ||exy||')
-
-    axsN[2].plot(t, iae_form_cum, '-', color=C_form, lw=LW,
-                label=f'IAE formación = {iae_form:.3f} m·s')
-    axsN[2].axhline(0, color='k', ls='--', lw=0.6)
-    axsN[2].set_ylabel('IAE [m·s]')
-    axsN[2].set_xlabel('Tiempo [s]')
-    axsN[2].legend(fontsize=9); axsN[2].grid(True, alpha=0.3)
-    axsN[2].set_title(f'IAE error de formación |dist_xy − {OFFSET_D:.1f}m|')
-
-    figN.tight_layout()
-
-    ##
-
     plt.ioff()
-    th      = np.linspace(0, 2*math.pi, 400)
+    
+    # Transformar coordenadas para Mission Planner si es necesario
+    if MISSION_PLANNER_STYLE:
+        lx_plot, ly_plot = ly, lx      # X = Este, Y = Norte
+        sx_plot, sy_plot = sy, sx
+        xd_plot, yd_plot = yd, xd
+        lxsp_plot, lysp_plot = lysp, lxsp
+        
+        # Círculo teórico intercambiado
+        th = np.linspace(0, 2 * math.pi, 400)
+        circ_x = RADIUS * np.sin(th)   # Este
+        circ_y = RADIUS * np.cos(th)   # Norte
+        
+        x_label = 'x [m]'
+        y_label = 'y [m]'
+        title_suffix = ' (Estilo Mission Planner)'
+    else:
+        lx_plot, ly_plot = lx, ly
+        sx_plot, sy_plot = sx, sy
+        xd_plot, yd_plot = xd, yd
+        lxsp_plot, lysp_plot = lxsp, lysp
+        
+        th = np.linspace(0, 2 * math.pi, 400)
+        circ_x = RADIUS * np.cos(th)
+        circ_y = RADIUS * np.sin(th)
+        
+        x_label = 'Norte [m]'
+        y_label = 'Este [m]'
+        title_suffix = ''
+    
     n_d     = 20
     idx_d   = np.round(np.linspace(0, n-1, n_d+2)).astype(int)[1:-1]
     n_fr    = 6
     idx_fr  = np.round(np.linspace(0, n-1, n_fr)).astype(int)
 
-    
-    ###########################################################
-    
-    
-    # Fig 1 — Trayectoria XY completa
+    # Fig 1 — Trayectoria XY completa (con estilo Mission Planner)
     fig1, ax = plt.subplots(figsize=(8, 8), facecolor='white')
-    ax.plot(lysp, lxsp, '--', color=C_refL, lw=LWS, label='Setpoint Líder', alpha=0.8)
-    ax.plot(yd,   xd,   '--', color=C_refS, lw=LWS, label='Setpoint Seguidor', alpha=0.8)
-    ax.plot(ly,   lx,   '-',  color=C_L,    lw=LW,  label='Líder real')
-    ax.plot(sy,   sx,   '-',  color=C_S,    lw=LW,  label='Seguidor real')
-    ax.plot(RADIUS*np.sin(th), RADIUS*np.cos(th), ':', color=[0.6,0.6,0.6], lw=1.0, label='Teórico')
-    ax.plot(ly[0], lx[0], 'o', ms=9, mfc=C_L, mec='k', mew=1.2, label='Inicio Líder')
-    ax.plot(sy[0], sx[0], 's', ms=8, mfc=C_S, mec='k', mew=1.2, label='Inicio Seguidor')
-    ax.plot(0, 0, '+k', ms=10, mew=2, label='Centro (0,0)')
-
+    ax.plot(lxsp_plot, lysp_plot, '--', color=C_refL, lw=LWS, label='Setpoint Líder', alpha=0.8)
+    ax.plot(xd_plot,   yd_plot,   '--', color=C_refS, lw=LWS, label='Setpoint Seguidor', alpha=0.8)
+    ax.plot(lx_plot,   ly_plot,   '-',  color=C_L,    lw=LW,  label='Líder real')
+    ax.plot(sx_plot,   sy_plot,   '-',  color=C_S,    lw=LW,  label='Seguidor real')
+    ax.plot(circ_x, circ_y, ':', color=[0.6,0.6,0.6], lw=1.0, label='Teórico')
+    ax.plot(lx_plot[0], ly_plot[0], 'o', ms=9, mfc=C_L, mec='k', mew=1.2, label='Inicio Líder')
+    ax.plot(sx_plot[0], sy_plot[0], 's', ms=8, mfc=C_S, mec='k', mew=1.2, label='Inicio Seguidor')
+    ax.plot(0, 0, '+k', ms=10, mew=2, label='Origen')
+    
     for i in idx_d:
-        ax.quiver(ly[i], lx[i],
-                sy[i]-ly[i], sx[i]-lx[i],
-                angles='xy', scale_units='xy', scale=1,
-                color=C_form, width=0.003, headwidth=3.5,
-                headlength=3.5, headaxislength=3, alpha=0.65)
-
+        ax.quiver(lx_plot[i], ly_plot[i], 
+                  sx_plot[i] - lx_plot[i], sy_plot[i] - ly_plot[i],
+                  angles='xy', scale_units='xy', scale=1,
+                  color=C_form, width=0.003, headwidth=3.5,
+                  headlength=3.5, headaxislength=3, alpha=0.65)
+    
     for i in idx_fr:
-        _draw_drone_frame(ax, ly[i], lx[i], psiL[i])
-        _draw_drone_frame(ax, sy[i], sx[i], psiS[i])
-
+        _draw_drone_frame(ax, lx_plot[i], ly_plot[i], psiL[i])
+        _draw_drone_frame(ax, sx_plot[i], sy_plot[i], psiS[i])
+    
     _draw_rtk_frame(ax)
-
-    ax.plot([], [], '-', color=[0.85,0.10,0.10], lw=2, label=r'$\hat{x}_D$ (frente)')
-    ax.plot([], [], '-', color=[0.10,0.65,0.10], lw=2, label=r'$\hat{y}_D$ (lateral)')
+    ax.plot([], [], '-', color=[0.85,0.10,0.10], lw=2, label=r'Frente')
+    ax.plot([], [], '-', color=[0.10,0.65,0.10], lw=2, label=r'Lateral')
     ax.plot([], [], '-', color=C_form, lw=1.5, label=r'Vector $\mathbf{d}$')
-    ax.set_aspect('equal'); ax.grid(True, alpha=0.3)
-    ax.set_xlabel(r'$y_{ENU}$ — Este [m]', fontsize=11)
-    ax.set_ylabel(r'$x_{ENU}$ — Norte [m]', fontsize=11)
-    ax.set_title('Trayectoria XY — fase círculo', fontsize=12)
-    ax.legend(loc='upper right', fontsize=8, framealpha=0.9); fig1.tight_layout()
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.set_xlabel(x_label, fontsize=11)
+    ax.set_ylabel(y_label, fontsize=11)
+    ax.set_title(f'Trayectoria XY — Líder y Seguidor{title_suffix}', fontsize=12)
+    ax.legend(loc='upper right', fontsize=8, framealpha=0.9)
+    fig1.tight_layout()
 
-    # Fig 2 — Posición y orientación vs tiempo
-    fig2, axs = plt.subplots(4, 1, figsize=(11, 9), sharex=True, facecolor='white')
-    fig2.suptitle('Posición y orientación vs Tiempo (fase círculo)', fontsize=13, fontweight='bold')
-    for a, dl, dd, ds, lbl in zip(axs,
-            [lx, ly, lz, np.degrees(psiL)],
-            [lxsp, lysp, [PREPOS_Z_LEADER]*n, np.degrees(psidesS)],
-            [sx, sy, sz, np.degrees(psiS)],
-            ['x [m]', 'y [m]', 'z [m]', 'ψ [°]']):
-        a.plot(t, dd, '--', color=C_refL, lw=LWS, label='Setpoint L')
-        a.plot(t, dl, '-',  color=C_L,    lw=LW,  label='Líder')
-        a.plot(t, ds, '-',  color=C_S,    lw=LW,  label='Seguidor')
-        a.set_ylabel(lbl); a.grid(True, alpha=0.3); a.legend(fontsize=8)
-    axs[-1].set_xlabel('Tiempo [s]'); fig2.tight_layout()
+    # Fig 2 — Trayectoria del Líder (setpoint vs real)
+    fig2, ax2 = plt.subplots(figsize=(7, 7), facecolor='white')
+    ax2.plot(lxsp_plot, lysp_plot, '--', color=C_refL, lw=LWS, label='Setpoint Líder')
+    ax2.plot(lx_plot,   ly_plot,   '-',  color=C_L,    lw=LW,  label='Líder real')
+    ax2.plot(lx_plot[0], ly_plot[0], 'o', ms=9, mfc=C_L, mec='k', mew=1.2, label='Inicio')
+    ax2.plot(0, 0, '+k', ms=10, mew=2, label='Origen')
+    for i in idx_fr[:4]:
+        _draw_drone_frame(ax2, lx_plot[i], ly_plot[i], psiL[i])
+    _draw_rtk_frame(ax2)
+    ax2.plot([], [], '-', color=[0.85,0.10,0.10], lw=2, label='Frente')
+    ax2.plot([], [], '-', color=[0.10,0.65,0.10], lw=2, label='Lateral')
+    ax2.set_aspect('equal')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xlabel(x_label)
+    ax2.set_ylabel(y_label)
+    ax2.set_title(f'Líder: Setpoint vs Trayectoria Real{title_suffix}', fontsize=12)
+    ax2.legend(loc='best', fontsize=8)
+    fig2.tight_layout()
 
-    # Fig 3 — Errores del seguidor
-    fig3, axs = plt.subplots(4, 1, figsize=(11, 8), sharex=True, facecolor='white')
-    fig3.suptitle('Errores del Seguidor (fase círculo)', fontsize=13, fontweight='bold')
-    for a, data, lbl in zip(axs,
+    # Fig 3 — Trayectoria del Seguidor (setpoint vs real)
+    fig3, ax3 = plt.subplots(figsize=(7, 7), facecolor='white')
+    ax3.plot(xd_plot, yd_plot, '--', color=C_refS, lw=LWS, label='Setpoint Seguidor')
+    ax3.plot(sx_plot, sy_plot, '-',  color=C_S,    lw=LW,  label='Seguidor real')
+    ax3.plot(sx_plot[0], sy_plot[0], 's', ms=8, mfc=C_S, mec='k', mew=1.2, label='Inicio')
+    ax3.plot(0, 0, '+k', ms=10, mew=2, label='Origen')
+    for i in idx_fr[:4]:
+        _draw_drone_frame(ax3, sx_plot[i], sy_plot[i], psiS[i])
+    _draw_rtk_frame(ax3)
+    ax3.plot([], [], '-', color=[0.85,0.10,0.10], lw=2, label='Frente')
+    ax3.plot([], [], '-', color=[0.10,0.65,0.10], lw=2, label='Lateral')
+    ax3.set_aspect('equal')
+    ax3.grid(True, alpha=0.3)
+    ax3.set_xlabel(x_label)
+    ax3.set_ylabel(y_label)
+    ax3.set_title(f'Seguidor: Setpoint vs Trayectoria Real{title_suffix}', fontsize=12)
+    ax3.legend(loc='best', fontsize=8)
+    fig3.tight_layout()
+
+    # Las figuras 4-7 no cambian porque son vs tiempo (X, Y, Z siguen siendo valores numéricos)
+    # Fig 4 — Posición y orientación vs tiempo
+    fig4, axs4 = plt.subplots(4, 1, figsize=(11, 9), sharex=True, facecolor='white')
+    fig4.suptitle('Posición y orientación vs Tiempo', fontsize=13, fontweight='bold')
+    axs4[0].plot(t, lxsp, '--', color=C_refL, lw=LWS, label='Setpoint L')
+    axs4[0].plot(t, xd,   '--', color=C_refS, lw=LWS, label='Setpoint S')
+    axs4[0].plot(t, lx,   '-',  color=C_L,    lw=LW,  label='x Líder')
+    axs4[0].plot(t, sx,   '-',  color=C_S,    lw=LW,  label='x Seguidor')
+    axs4[0].set_ylabel('x [m]'); axs4[0].grid(True, alpha=0.3)
+    axs4[0].legend(loc='best', ncol=2, fontsize=8); axs4[0].set_title('Posición X')
+    axs4[1].plot(t, lysp, '--', color=C_refL, lw=LWS)
+    axs4[1].plot(t, yd,   '--', color=C_refS, lw=LWS)
+    axs4[1].plot(t, ly,   '-',  color=C_L,    lw=LW)
+    axs4[1].plot(t, sy,   '-',  color=C_S,    lw=LW)
+    axs4[1].set_ylabel('y [m]'); axs4[1].grid(True, alpha=0.3); axs4[1].set_title('Posición Y')
+    axs4[2].plot(t, [PREPOS_Z_LEADER]*len(t), '--', color=C_refL, lw=LWS, label='Setpoint L')
+    axs4[2].plot(t, zd,    '--', color=C_refS, lw=LWS, label='Setpoint S')
+    axs4[2].plot(t, lz,    '-',  color=C_L,    lw=LW,  label='z Líder')
+    axs4[2].plot(t, sz,    '-',  color=C_S,    lw=LW,  label='z Seguidor')
+    axs4[2].set_ylabel('z [m]'); axs4[2].grid(True, alpha=0.3)
+    axs4[2].legend(loc='best', ncol=2, fontsize=8); axs4[2].set_title('Altitud')
+    axs4[3].plot(t, np.degrees(psidesS), '--', color=C_refS, lw=LWS, label='Setpoint S')
+    axs4[3].plot(t, np.degrees(psiL),    '-',  color=C_L,    lw=LW,  label='ψ Líder')
+    axs4[3].plot(t, np.degrees(psiS),    '-',  color=C_S,    lw=LW,  label='ψ Seguidor')
+    axs4[3].set_ylabel('ψ [°]'); axs4[3].set_xlabel('Tiempo [s]')
+    axs4[3].grid(True, alpha=0.3)
+    axs4[3].legend(loc='best', ncol=2, fontsize=8); axs4[3].set_title('Yaw')
+    fig4.tight_layout()
+
+    # Fig 5 — Errores del seguidor
+    fig5, axs5 = plt.subplots(4, 1, figsize=(11, 8), sharex=True, facecolor='white')
+    fig5.suptitle('Errores del Seguidor respecto a su setpoint', fontsize=13, fontweight='bold')
+    for ax5, data, lbl in zip(axs5,
             [ex, ey, ez, np.degrees(e_yaw)],
             [r'$e_x$ [m]', r'$e_y$ [m]', r'$e_z$ [m]', r'$e_\psi$ [°]']):
-        a.plot(t, data, '-', color=C_S, lw=LW)
-        a.axhline(0, color='k', ls='--', lw=0.8, alpha=0.5)
-        a.set_ylabel(lbl); a.grid(True, alpha=0.3)
-    axs[-1].set_xlabel('Tiempo [s]'); fig3.tight_layout()
+        ax5.plot(t, data, '-', color=C_S, lw=LW)
+        ax5.axhline(0, color='k', ls='--', lw=0.8, alpha=0.5)
+        ax5.set_ylabel(lbl); ax5.grid(True, alpha=0.3)
+    axs5[-1].set_xlabel('Tiempo [s]')
+    fig5.tight_layout()
 
-    # Fig 4 — Distancia L-S
-    fig4, axs = plt.subplots(3, 1, figsize=(11, 8), sharex=True, facecolor='white')
-    fig4.suptitle('Distancia de Formación L-S (fase círculo)', fontsize=13, fontweight='bold')
-    axs[0].plot(t, dist_xy, '-', color=C_dist, lw=LW, label='Distancia XY real')
-    axs[0].axhline(OFFSET_D, color='r', ls='--', lw=1.5, label=f'Objetivo d={OFFSET_D:.1f}m')
-    axs[0].set_ylabel('Dist XY [m]'); axs[0].legend(fontsize=9); axs[0].grid(True, alpha=0.3)
-    axs[1].plot(t, dist_z, '-', color=[0.55,0.25,0.65], lw=LW, label='Distancia Z real')
-    axs[1].axhline(OFFSET_DZ, color='r', ls='--', lw=1.5, label=f'Objetivo Δz={OFFSET_DZ:.1f}m')
-    axs[1].set_ylabel('Dist Z [m]'); axs[1].legend(fontsize=9); axs[1].grid(True, alpha=0.3)
-    axs[2].plot(t, np.degrees(psiL), '-', color=C_L, lw=LW, label='ψ Líder')
-    axs[2].plot(t, np.degrees(psiS), '-', color=C_S, lw=LW, label='ψ Seguidor')
-    axs[2].set_ylabel('ψ [°]'); axs[2].set_xlabel('Tiempo [s]')
-    axs[2].legend(fontsize=9); axs[2].grid(True, alpha=0.3); fig4.tight_layout()
+    # Fig 6 — Distancia L-S y yaw comparado
+    fig6, axs6 = plt.subplots(3, 1, figsize=(11, 8), sharex=True, facecolor='white')
+    fig6.suptitle('Distancia de Formación L-S y Yaw', fontsize=13, fontweight='bold')
+    axs6[0].plot(t, dist_xy, '-', color=C_dist, lw=LW, label='Distancia XY real')
+    axs6[0].axhline(OFFSET_D, color='r', ls='--', lw=1.5, label=f'Objetivo d={OFFSET_D:.1f}m')
+    axs6[0].set_ylabel('Dist XY [m]'); axs6[0].legend(fontsize=9); axs6[0].grid(True, alpha=0.3)
+    axs6[1].plot(t, dist_z, '-', color=[0.55,0.25,0.65], lw=LW, label='Distancia Z real')
+    axs6[1].axhline(OFFSET_DZ, color='r', ls='--', lw=1.5, label=f'Objetivo Δz={OFFSET_DZ:.1f}m')
+    axs6[1].set_ylabel('Dist Z [m]'); axs6[1].legend(fontsize=9); axs6[1].grid(True, alpha=0.3)
+    axs6[2].plot(t, np.degrees(psiL), '-', color=C_L, lw=LW, label='ψ Líder')
+    axs6[2].plot(t, np.degrees(psiS), '-', color=C_S, lw=LW, label='ψ Seguidor')
+    axs6[2].set_ylabel('ψ [°]'); axs6[2].set_xlabel('Tiempo [s]')
+    axs6[2].legend(fontsize=9); axs6[2].grid(True, alpha=0.3)
+    fig6.tight_layout()
 
-    # Fig 5 — Desglose PID
-    fig5, axs = plt.subplots(2, 1, figsize=(11, 7), sharex=True, facecolor='white')
-    fig5.suptitle('Desglose PID + Feed-forward (fase círculo)', fontsize=13, fontweight='bold')
-    for a, ff, pp, dd, cmd, lb in zip(axs,
+    # Fig 7 — Desglose PID
+    fig7, axs7 = plt.subplots(2, 1, figsize=(11, 7), sharex=True, facecolor='white')
+    fig7.suptitle('Desglose del Controlador PID + Feed-forward del Seguidor',
+                  fontsize=13, fontweight='bold')
+    for ax7, ff, pp, dd, cmd, lb in zip(axs7,
             [ff_x, ff_y], [vx_p, vy_p], [vx_d, vy_d], [vx_cmd, vy_cmd],
             ['Eje X [m/s]', 'Eje Y [m/s]']):
-        a.plot(t, ff,  lw=LWS, label='Feed-forward', color=[0.85,0.55,0.10])
-        a.plot(t, pp,  lw=LWS, label='Proporcional', color=C_L)
-        a.plot(t, dd,  lw=LWS, label='Derivativo',   color=C_dist)
-        a.plot(t, cmd, 'k-',   lw=LW,  alpha=0.85,   label='Cmd total')
-        a.axhline(0, color='gray', ls='--', lw=0.6)
-        a.set_ylabel(lb); a.legend(fontsize=8); a.grid(True, alpha=0.3)
-    axs[-1].set_xlabel('Tiempo [s]'); fig5.tight_layout()
+        ax7.plot(t, ff,  lw=LWS, label='Feed-forward', color=[0.85,0.55,0.10])
+        ax7.plot(t, pp,  lw=LWS, label='Proporcional', color=C_L)
+        ax7.plot(t, dd,  lw=LWS, label='Derivativo',   color=C_dist)
+        ax7.plot(t, cmd, 'k-',   lw=LW,  alpha=0.85,   label='Cmd total')
+        ax7.axhline(0, color='gray', ls='--', lw=0.6)
+        ax7.set_ylabel(lb); ax7.legend(fontsize=8); ax7.grid(True, alpha=0.3)
+    axs7[-1].set_xlabel('Tiempo [s]')
+    fig7.tight_layout()
 
     plt.show()
 
@@ -1471,6 +1796,10 @@ def plot_results():
 if __name__ == '__main__':
     print("=" * 65)
     print("  LF_Circulo_RT_v2 — Líder-Seguidor con Despegue")
+    if MISSION_PLANNER_STYLE:
+        print("  Visualización: Estilo Mission Planner (x = Este, y = Norte)")
+    else:
+        print("  Visualización: Estilo ENU estándar (x = Norte, y = Este)")
     print("=" * 65)
     print(f"  Líder    : {LEADER_CONN}  (SYSID {LEADER_SYSID})")
     print(f"  Seguidor : {FOLLOWER_CONN} (SYSID {FOLLOWER_SYSID})")
@@ -1562,22 +1891,26 @@ if __name__ == '__main__':
     # ══════════════════════════════════════════════════════════════════════════
     print("\n" + "─"*65)
     print("  FASE DE DESPEGUE")
+    print("  ℹ️  Los drones deben estar en STABILIZE. El script arma, cambia a GUIDED y despega.")
     print("─"*65)
-    print("  Asegúrate de que ambos drones están en tierra y listos.")
 
     # Líder
-    input("\n  ENTER para iniciar despegue del LÍDER...\n")
     set_traj_phase('takeoff_L')
-    do_takeoff(master_leader, LEADER_SYSID, LEADER_COMPID,
-               get_leader, TAKEOFF_ALT_LEADER, 'LÍDER')
+    if _prompt(f"Armar y despegar LÍDER a {TAKEOFF_ALT_LEADER} m AGL"):
+        do_takeoff(master_leader, LEADER_SYSID, LEADER_COMPID,
+                   get_leader, TAKEOFF_ALT_LEADER, 'LÍDER')
+    else:
+        print("  [LÍDER] Despegue saltado — se asume ya en el aire.")
 
     # Seguidor
-    input("\n  ENTER para iniciar despegue del SEGUIDOR...\n")
     set_traj_phase('takeoff_S')
-    do_takeoff(master_follower, FOLLOWER_SYSID, FOLLOWER_COMPID,
-               get_follower, TAKEOFF_ALT_FOLLOWER, 'SEGUIDOR')
+    if _prompt(f"Armar y despegar SEGUIDOR a {TAKEOFF_ALT_FOLLOWER} m AGL"):
+        do_takeoff(master_follower, FOLLOWER_SYSID, FOLLOWER_COMPID,
+                   get_follower, TAKEOFF_ALT_FOLLOWER, 'SEGUIDOR')
+    else:
+        print("  [SEGUIDOR] Despegue saltado — se asume ya en el aire.")
 
-    print("\n  ✅ Ambos drones en el aire.")
+    print("\n  ✅ Fase de despegue completada.")
 
     # ══════════════════════════════════════════════════════════════════════════
     # PREPOSICIONAMIENTO
@@ -1588,23 +1921,20 @@ if __name__ == '__main__':
     dx_off, dy_off, _ = compute_offset(yaw_inicial)
     S_x = L_x + dx_off;  S_y = L_y + dy_off;  S_z = PREPOS_Z_FOLLOWER
 
-    if SKIP_PREPOS:
-        print(f"\n⏭️  Preposicionamiento OMITIDO (SKIP_PREPOS=True)")
-        print(f"  Líder    esperado en ENU ({L_x:.2f}, {L_y:.2f})  z={L_z:.1f}m")
-        print(f"  Seguidor esperado en ENU ({S_x:.2f}, {S_y:.2f})  z={S_z:.1f}m")
-        input("  Confirma que los drones están en posición → ENTER\n")
-        set_traj_phase('prepos')
-    else:
-        input("\n  ENTER para iniciar preposicionamiento...\n")
+    set_traj_phase('prepos')
+    print(f"\n  Líder    → ENU ({L_x:.2f}, {L_y:.2f})  z={L_z:.1f}m")
+    print(f"  Seguidor → ENU ({S_x:.2f}, {S_y:.2f})  z={S_z:.1f}m")
+    if not SKIP_PREPOS and _prompt("Iniciar preposicionamiento automático"):
         preposition(master_leader, master_follower)
+    else:
+        print("  ⏭️  Preposicionamiento saltado — confirma posiciones manualmente.")
 
     # ══════════════════════════════════════════════════════════════════════════
     # CÍRCULO + PID
     # ══════════════════════════════════════════════════════════════════════════
     print("\n" + "─"*65)
-    input("  ENTER para iniciar el círculo + seguimiento...\n")
+    _prompt("Iniciar el círculo + seguimiento")
 
-    # El t0 del log de CONTROL se mide desde aquí (igual que v1)
     circle_t0   = time.monotonic()
     leader_sp_q = {}
 
@@ -1661,24 +1991,31 @@ if __name__ == '__main__':
     # ══════════════════════════════════════════════════════════════════════════
     # REGRESO
     # ══════════════════════════════════════════════════════════════════════════
-    if RETURN_ENABLED and not SKIP_RETURN and not _stop_all.is_set():
-        return_to_start(master_leader, master_follower,
-                        L_x, L_y, L_z, S_x, S_y, S_z)
+    if RETURN_ENABLED and not _stop_all.is_set():
+        if not SKIP_RETURN and _prompt("Iniciar regreso al punto de preposicionamiento"):
+            return_to_start(master_leader, master_follower,
+                            L_x, L_y, L_z, S_x, S_y, S_z)
+        else:
+            print("  ⏭️  Regreso saltado.")
 
     # ══════════════════════════════════════════════════════════════════════════
     # ATERRIZAJE
     # ══════════════════════════════════════════════════════════════════════════
     if not _stop_all.is_set():
         print("\n" + "─"*65)
-        input("  ENTER para aterrizar el LÍDER...\n")
         set_traj_phase('land_L')
-        do_land(master_leader, LEADER_SYSID, LEADER_COMPID, get_leader, 'LÍDER')
+        if _prompt("Aterrizar LÍDER"):
+            do_land(master_leader, LEADER_SYSID, LEADER_COMPID, get_leader, 'LÍDER')
+        else:
+            print("  [LÍDER] Aterrizaje saltado.")
 
-        input("\n  ENTER para aterrizar el SEGUIDOR...\n")
         set_traj_phase('land_S')
-        do_land(master_follower, FOLLOWER_SYSID, FOLLOWER_COMPID, get_follower, 'SEGUIDOR')
+        if _prompt("Aterrizar SEGUIDOR"):
+            do_land(master_follower, FOLLOWER_SYSID, FOLLOWER_COMPID, get_follower, 'SEGUIDOR')
+        else:
+            print("  [SEGUIDOR] Aterrizaje saltado.")
 
-        print("\n  ✅ Ambos drones en tierra.")
+        print("\n  ✅ Fase de aterrizaje completada.")
 
     # ── Detener todo ──────────────────────────────────────────────────────────
     stop_traj_log()
@@ -1691,9 +2028,13 @@ if __name__ == '__main__':
     print("🔌 Conexiones cerradas.")
 
     # ── Guardar CSVs ──────────────────────────────────────────────────────────
-    control_csv = save_control_csv()   # log de control (solo fase PID)
-    traj_csv    = save_traj_csv()      # log de trayectoria (todo el vuelo)
-    generate_rviz_replay(traj_csv)     # replay usa el log de trayectoria
+    control_csv = save_control_csv()
+    traj_csv    = save_traj_csv()
+    save_prepos_csv()
+    generate_rviz_replay(traj_csv)
+
+    # ── Mostrar métricas integrales ───────────────────────────────────────────
+    print_integral_metrics()
 
     # ── Gráficas post-vuelo ───────────────────────────────────────────────────
-    plot_results()   # gráficas usan el log de control (igual que v1)
+    plot_results()

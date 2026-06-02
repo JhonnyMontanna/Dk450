@@ -1,0 +1,7 @@
+variable,units,IAE
+e_x (follower),m,16.718858113959335
+e_y (follower),m,7.765759268811978
+e_z (follower),m,1.3513363297359289
+e_ψ (follower),rad,4.316849925796692
+error_xy (follower),m,19.75846881635147
+formation error,m,10.363878014370853
