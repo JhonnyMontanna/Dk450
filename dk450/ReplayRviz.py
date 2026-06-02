@@ -681,6 +681,8 @@ class ReplayNode(Node):
 # =============================================================================
 
 def main():
+    global FRAME_ID, PLAYBACK_SPEED
+
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--master", default=CSV_FILE,
@@ -691,7 +693,6 @@ def main():
                     help=f"Frame de RViz2 (default: {FRAME_ID})")
     args = ap.parse_args()
 
-    global FRAME_ID, PLAYBACK_SPEED
     FRAME_ID       = args.frame
     PLAYBACK_SPEED = args.speed
 
