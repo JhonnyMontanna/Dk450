@@ -297,6 +297,10 @@ class LogReplayNode(Node):
         t_arr = self.t_arr
         n     = self.n
 
+        print(f"\n[DEBUG] speed={self.speed}  n={self.n}  "
+              f"duracion_log={t_arr[-1]-t_arr[0]:.1f}s  "
+              f"duracion_esperada={( t_arr[-1]-t_arr[0])/self.speed:.1f}s\n")
+
         while not self._stop.is_set():
             log_t0   = t_arr[0]
             wall_t0  = time.perf_counter()
@@ -321,13 +325,14 @@ class LogReplayNode(Node):
                                 self.sqx[i], self.sqy[i], self.sqz[i], self.sqw[i],
                                 stamp)
 
-                if i % 200 == 0:
+                if i % 50 == 0:
                     wall_elapsed = time.perf_counter() - wall_t0
+                    esperado     = (log_t - log_t0) / self.speed
                     self.get_logger().info(
-                        f"[Replay] log={log_t:.1f}s  wall={wall_elapsed:.1f}s  "
-                        f"fase={self.phases[i]}  "
-                        f"L=({self.lx[i]:.2f},{self.ly[i]:.2f},{self.lz[i]:.2f})  "
-                        f"S=({self.sx[i]:.2f},{self.sy[i]:.2f},{self.sz[i]:.2f})"
+                        f"[Replay] log={log_t:.1f}s  "
+                        f"wall={wall_elapsed:.2f}s  esperado={esperado:.2f}s  "
+                        f"ratio={wall_elapsed/(esperado+1e-9):.2f}x  "
+                        f"speed_param={self.speed}"
                     )
 
             if not self.loop:
