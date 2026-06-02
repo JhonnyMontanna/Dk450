@@ -188,6 +188,8 @@ class LogReplayNode(Node):
         self.speed        = speed
         self.loop         = loop
         self.publish_path = publish_path
+        self.path_decim   = 10  # publicar path 1 de cada N muestras
+        self._frame_count = 0
 
         # Pre-extraer arrays numpy para acceso O(1) sin iloc
         self.t_arr  = df["t"].values.astype(float)
@@ -268,7 +270,9 @@ class LogReplayNode(Node):
         p["odom"].publish(odom)
 
         # Path
-        if self.publish_path:
+        # Path — solo 1 de cada path_decim muestras para evitar serialización cuadrática
+        self._frame_count += 1
+        if self.publish_path and (self._frame_count % self.path_decim == 0):
             ps = PoseStamped(); ps.header=odom.header; ps.pose=odom.pose.pose
             pm = p["path_msg"]; pm.header.stamp=stamp; pm.poses.append(ps)
             p["path"].publish(pm)
@@ -360,6 +364,8 @@ def main():
                     help="Factor velocidad (1.0=tiempo real, 10.0=x10)")
     ap.add_argument("--loop",    action="store_true")
     ap.add_argument("--no-path", action="store_true")
+    ap.add_argument("--path-decim", type=int, default=10,
+                    help="Publicar 1 de cada N poses en el Path (default: 10)")
     ap.add_argument("--ox",  type=float, default=None)
     ap.add_argument("--oy",  type=float, default=None)
     ap.add_argument("--ozl", type=float, default=None)
@@ -381,6 +387,7 @@ def main():
     rclpy.init()
     node = LogReplayNode(df, speed=args.speed, loop=args.loop,
                          publish_path=not args.no_path)
+    node.path_decim = args.path_decim
 
     # MultiThreadedExecutor: el executor corre en su propio hilo del OS,
     # completamente separado del hilo de replay → sin contención de GIL
