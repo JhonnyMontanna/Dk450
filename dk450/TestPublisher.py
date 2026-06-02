@@ -6,19 +6,23 @@ Corre en tu máquina con ROS 2 activo y un CSV real:
 
 Imprime un desglose por sección del loop.
 
+[Bench] Midiendo 500 muestras a speed=10.0x …
 
-Benchmarking 500 iteraciones (2x odom + 2x marker + 2x TF por iter)...
+=======================================================
+  Muestras medidas   : 500
+  Duración log       : 4.90 s
+  Esperado (speed=10.0x): 0.49 s
+  Tiempo real total  : 0.50 s
+  Ratio real/esperado: 1.03x  (1.0 = perfecto)
 
-Resultados:
-  Tiempo total:        0.159 s para 500 iters
-  Tiempo por muestra:  0.317 ms
-  Throughput máximo:   3150 muestras/s
+  Desglose por muestra:
+    sleep   : 0.001 ms  (0.1%)
+    publish : 0.983 ms  (97.5%)
+    stamp   : 0.012 ms  (1.2%)
+    overruns: 500/500 muestras llegaron tarde (>1ms)
+=======================================================
 
-Implicaciones:
-  A 10 Hz (log típico): speed máximo alcanzable = 315x
-  A 50 Hz (log rápido): speed máximo alcanzable = 63x
-
-
+✅ Timing correcto. Si RViz va lento, el problema es de visualización.
 """
 import sys
 import time
