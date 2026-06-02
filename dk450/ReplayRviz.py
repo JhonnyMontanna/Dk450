@@ -1,193 +1,124 @@
 #!/usr/bin/env python3
 """
-rviz_replay_v2.py
-=================
-Reproduce en RViz2 la trayectoria líder-seguidor desde master_telemetry.csv.
-Basado en MavrosVisualizer.py — usa el mismo pipeline GPS→ECEF→ENU→RTK local.
+log_replay_rviz.py
+==================
+Reproduce un log CSV (master_telemetry.csv) en RViz en "tiempo real" simulado.
 
-COORDENADAS:
-  El mismo cálculo que MultiDroneVisualizer:
-    GPS (lat,lon,alt) → ECEF → ENU → rotación theta → frame rtk_odom
-  Así la trayectoria replay se alinea perfectamente con el visualizador en vivo.
+Combina:
+  · La lógica de transformación ENU + offsets de ReplayTotal.py
+  · Los publishers/TF/Markers de MavrosVisualizer.py
 
-DIFERENCIACIÓN VISUAL (RViz2 no soporta líneas punteadas):
-  Drones  → color fijo   (líder: azul  #1565C0 | seguidor: rojo #C62828)
-  Fases   → grosor + alpha de línea:
-              TAKEOFF      0.03 m  alpha 0.35
-              POSITIONING  0.05 m  alpha 0.65
-              TRAJECTORY   0.10 m  alpha 1.00
-              LANDING      0.03 m  alpha 0.45
+Drones publicados:
+  · uav1  — Líder   (azul en RViz)
+  · uav2  — Seguidor (rojo en RViz)
 
-MARCADORES:
-  ★ Esfera grande  — inicio físico de cada dron
-  ● Esfera media   — condición inicial de TRAJECTORY
-  ■ Cubo aplanado  — setpoint de preposicionamiento
-  Círculos teóricos como LINE_STRIP
-
-TÓPICOS:
-  /replay/trajectory       MarkerArray — trayectoria acumulada animada
-  /replay/current_pos      MarkerArray — esfera posición actual
-  /replay/static_markers   MarkerArray — marcadores fijos (una vez)
-  /replay/phase_label      MarkerArray — texto fase + tiempo
-
-FRAME: rtk_odom  (mismo que MavrosVisualizer)
+Topics publicados por dron (mismo esquema que MavrosVisualizer):
+  /{ns}/gps/odom            nav_msgs/Odometry
+  /{ns}/gps/drone_path      nav_msgs/Path
+  /{ns}/gps/drone_marker    visualization_msgs/Marker  (texto + esfera)
+  TF:  rtk_odom → {ns}_base_link
+       rtk_odom → {ns}_base_footprint
 
 USO:
-  python3 rviz_replay_v2.py --master master_telemetry.csv --speed 1.0
+  python log_replay_rviz.py
+  python log_replay_rviz.py --master vuelo1.csv
+  python log_replay_rviz.py --master vuelo1.csv --speed 2.0 --loop
+  python log_replay_rviz.py --master vuelo1.csv --speed 0  # paso a paso
 
-  Parámetros opcionales (mismos que MavrosVisualizer):
-    --origin_lat  --origin_lon  --origin_alt
-    --calib_ang
-    --speed   (factor de velocidad, default 1.0)
+PARÁMETROS CLAVE:
+  --master   CSV de telemetría  (default: master_telemetry.csv)
+  --speed    Factor de velocidad de reproducción  (default: 1.0)
+             0 = paso a paso (pulsa Enter para avanzar)
+  --loop     Repetir indefinidamente al terminar
+  --no-path  No publicar los Path (útil si el log es muy largo)
 """
 
 import sys
 import math
 import time
 import argparse
-import threading
 
 import numpy as np
 import pandas as pd
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
-from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+
 from std_msgs.msg import ColorRGBA
-from builtin_interfaces.msg import Duration
+from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import PoseStamped, TransformStamped, Quaternion
+from visualization_msgs.msg import Marker
+from tf2_ros import TransformBroadcaster
+from builtin_interfaces.msg import Time as RosTime
+
 
 # =============================================================================
-#  CONFIGURACIÓN  ← EDITAR
+# ── CONFIGURACIÓN (igual que ReplayTotal.py) ──────────────────────────────────
 # =============================================================================
 
-CSV_FILE       = "master_telemetry.csv"
-PLAYBACK_SPEED = 1.0      # 1.0=tiempo real | 2.0=doble velocidad
-PUBLISH_RATE   = 20       # Hz
+CSV_FILE = "master_telemetry.csv"
 
-# ── Origen RTK (igual que MavrosVisualizer) ───────────────────────────────────
-ORIGIN_LAT = 19.5942341
-ORIGIN_LON = -99.2280871
-ORIGIN_ALT = 2329.0
-
-# ── Calibración angular ───────────────────────────────────────────────────────
-# Ángulo de rotación CCW en grados (calib_mode='angle' de MavrosVisualizer)
-# Ajustar para que el norte apunte correctamente en RViz
-CALIB_ANG_DEG = 180.0
-
-# ── Fases de vuelo (segundos) — AJUSTAR con los tiempos reales ───────────────
+# Fases de vuelo  ← ajustar igual que en ReplayTotal
 PHASE_TIMES = {
-    "TAKEOFF":     (0.0,    15.0),
-    "POSITIONING": (15.0,   45.0),
-    "TRAJECTORY":  (45.0,  145.0),
-    "LANDING":     (145.0,  None),   # None = hasta el final
+    "TAKEOFF":     (0.0,    35.0),
+    "POSITIONING": (35.0,   75.0),
+    "TRAJECTORY":  (80.0,  125.0),
+    "LANDING":     (150.0,  None),
 }
 
-# ── Parámetros del experimento ────────────────────────────────────────────────
-RADIUS    = 4.0    # radio teórico círculo líder [m]
-OFFSET_D  = 2.0    # separación teórica líder-seguidor [m]
-OFFSET_DZ = 1.0    # diferencia de altitud objetivo [m]
+R_EARTH  = 6_371_000.0
+RADIUS   = 4.0
+OFFSET_D = 2.0
+OFFSET_DZ = 1.0
 
-# ── Setpoints de preposicionamiento en coordenadas RTK local ─────────────────
-# Poner None si no aplica
-SP_PREPOS = {
-    "L": {"x": -4.0, "y": 0.0, "z": 4.0},
-    "S": {"x": -6.0, "y": 0.0, "z": 4.0},
-}
+CENTER_OFFSET_X          =  0.0
+CENTER_OFFSET_Y          =  0.0
+CENTER_OFFSET_Z_LEADER   =  0.0
+CENTER_OFFSET_Z_FOLLOWER =  0.0
 
-# =============================================================================
-# FIN DE CONFIGURACIÓN
-# =============================================================================
-
-# WGS84
-WGS84_A  = 6_378_137.0
-WGS84_E2 = 6.69437999014e-3
-
-# Colores dron (RGBA 0-1)
-COLOR_LEADER   = (0.15, 0.40, 0.85, 1.0)
-COLOR_FOLLOWER = (0.85, 0.15, 0.15, 1.0)
-
-# Grosor [m] y alpha por fase
-PHASE_VIZ = {
-    "TAKEOFF":     (0.030, 0.35),
-    "POSITIONING": (0.050, 0.65),
-    "TRAJECTORY":  (0.100, 1.00),
-    "LANDING":     (0.030, 0.45),
-    "UNKNOWN":     (0.015, 0.20),
-}
-
-PHASE_LABEL = {
-    "TAKEOFF":     "DESPEGUE",
-    "POSITIONING": "POSICIONAMIENTO",
-    "TRAJECTORY":  "TRAYECTORIA / CONTROL",
-    "LANDING":     "ATERRIZAJE",
-    "UNKNOWN":     "",
-}
-
-SPHERE_CURRENT = 0.25
-SPHERE_START   = 0.35
-SPHERE_CI      = 0.22
-CUBE_SP        = 0.20
+CIRCLE_TRIM_START = 0.10
+CIRCLE_TRIM_END   = 0.05
 
 
 # =============================================================================
-# PIPELINE DE COORDENADAS (igual que MavrosVisualizer)
+# ── UTILIDADES (de ReplayTotal.py) ────────────────────────────────────────────
 # =============================================================================
 
-def geodetic_to_ecef(lat_r, lon_r, alt):
-    N = WGS84_A / math.sqrt(1.0 - WGS84_E2 * math.sin(lat_r)**2)
-    x = (N + alt) * math.cos(lat_r) * math.cos(lon_r)
-    y = (N + alt) * math.cos(lat_r) * math.sin(lon_r)
-    z = (N * (1.0 - WGS84_E2) + alt) * math.sin(lat_r)
-    return x, y, z
+def gps_to_enu(lat, lon, ref_lat, ref_lon):
+    ref_lat_r = math.radians(ref_lat)
+    x = math.radians(lat - ref_lat) * R_EARTH
+    y = math.radians(lon - ref_lon) * R_EARTH * math.cos(ref_lat_r)
+    return x, y
 
 
-def get_rotation_matrix(lat_r, lon_r):
-    return np.array([
-        [-math.sin(lon_r),
-          math.cos(lon_r),
-          0.0],
-        [-math.sin(lat_r) * math.cos(lon_r),
-         -math.sin(lat_r) * math.sin(lon_r),
-          math.cos(lat_r)],
-        [ math.cos(lat_r) * math.cos(lon_r),
-          math.cos(lat_r) * math.sin(lon_r),
-          math.sin(lat_r)],
-    ])
+def fit_circle(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    valid = np.isfinite(x) & np.isfinite(y)
+    x, y = x[valid], y[valid]
+    if len(x) < 4:
+        return 0.0, 0.0, RADIUS, np.nan
+    A = np.column_stack([2*x, 2*y, np.ones(len(x))])
+    b = x**2 + y**2
+    res, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    cx, cy = res[0], res[1]
+    r = math.sqrt(max(res[2] + cx**2 + cy**2, 0.0))
+    resid = np.sqrt((x - cx)**2 + (y - cy)**2) - r
+    rms = math.sqrt(np.mean(resid**2))
+    return cx, cy, r, rms
 
-
-def gps_to_rtk(lat_deg, lon_deg, alt,
-               X0, Y0, Z0, R_enu, theta):
-    """
-    Convierte GPS (grados, metros) al frame RTK local.
-    Pipeline idéntico a cb_navsat() en MavrosVisualizer.
-    Devuelve (xr, yr, zr).
-    """
-    lat_r = math.radians(lat_deg)
-    lon_r = math.radians(lon_deg)
-    Xe, Ye, Ze = geodetic_to_ecef(lat_r, lon_r, alt)
-    d   = np.array([Xe - X0, Ye - Y0, Ze - Z0])
-    enu = R_enu.dot(d)
-    xr  = enu[0] * math.cos(theta) - enu[1] * math.sin(theta)
-    yr  = enu[0] * math.sin(theta) + enu[1] * math.cos(theta)
-    zr  = float(enu[2])
-    return xr, yr, zr
-
-
-# =============================================================================
-# UTILIDADES DE DATOS
-# =============================================================================
 
 def assign_phases(t_arr, phase_times):
     phases = np.full(len(t_arr), "UNKNOWN", dtype=object)
-    t_max  = float(t_arr[-1])
+    t_max = t_arr[-1]
     for name, interval in phase_times.items():
         if interval is None:
             continue
         t0, t1 = interval
-        t1 = t_max if t1 is None else float(t1)
-        phases[(t_arr >= t0) & (t_arr <= t1)] = name
+        t1 = t_max if t1 is None else t1
+        mask = (t_arr >= t0) & (t_arr <= t1)
+        phases[mask] = name
     return phases
 
 
@@ -205,517 +136,380 @@ def phase_segments(phases, label):
     return segs
 
 
-def load_data(path, X0, Y0, Z0, R_enu, theta):
-    """
-    Carga el CSV y convierte GPS→RTK local usando el mismo pipeline
-    que MavrosVisualizer. Altitud: usa L_alt/S_alt (GPS barométrico)
-    descontando la altitud de suelo para obtener altura relativa.
-    """
-    print(f"[IO] Cargando {path} …")
+def load_and_transform(path):
+    print(f"\n[IO] Cargando {path} …")
     df = pd.read_csv(path, sep=None, engine="python")
     df = df.sort_values("t").reset_index(drop=True)
     print(f"     {len(df)} filas · {len(df.columns)} columnas")
+
+    # Origen ENU
+    mask_gps = df["L_lat"].notna() & df["L_lon"].notna()
+    if not mask_gps.any():
+        raise ValueError("No hay GPS del líder (L_lat/L_lon) en el CSV.")
+    first   = df[mask_gps].iloc[0]
+    ref_lat = float(first["L_lat"])
+    ref_lon = float(first["L_lon"])
+    print(f"[ENU] Origen → lat={ref_lat:.8f}  lon={ref_lon:.8f}")
+
+    for pfx in ("L", "S"):
+        clat, clon = f"{pfx}_lat", f"{pfx}_lon"
+        has = df[clat].notna() & df[clon].notna()
+        ex = np.full(len(df), np.nan)
+        ey = np.full(len(df), np.nan)
+        if has.any():
+            vals = df.loc[has, [clat, clon]].apply(
+                lambda r: gps_to_enu(r[clat], r[clon], ref_lat, ref_lon), axis=1)
+            ex[has.values] = [v[0] for v in vals]
+            ey[has.values] = [v[1] for v in vals]
+        df[f"{pfx}_ex"] = ex
+        df[f"{pfx}_ey"] = ey
+
+    for pfx in ("L", "S"):
+        alt_col = f"{pfx}_alt"
+        z_col   = f"{pfx}_z"
+        cz_col  = f"{pfx}_cz"
+        off = CENTER_OFFSET_Z_LEADER if pfx == "L" else CENTER_OFFSET_Z_FOLLOWER
+        if alt_col in df.columns and df[alt_col].notna().any():
+            alt_vals   = df[alt_col].values.astype(float)
+            alt_ground = np.nanmin(alt_vals[:min(20, len(alt_vals))])
+            df[cz_col] = alt_vals - alt_ground + off
+        elif z_col in df.columns and df[z_col].notna().any():
+            df[cz_col] = -df[z_col].values.astype(float) + off
+        else:
+            df[cz_col] = np.nan
 
     t_arr  = df["t"].values
     phases = assign_phases(t_arr, PHASE_TIMES)
     df["phase"] = phases
 
-    # ── Convertir GPS → RTK local por dron ───────────────────────────────────
-    for pfx in ("L", "S"):
-        has = df[f"{pfx}_lat"].notna() & df[f"{pfx}_lon"].notna()
+    # Ajuste círculo
+    traj_mask = phases == "TRAJECTORY"
+    if traj_mask.sum() > 10:
+        idx_traj = np.where(traj_mask)[0]
+        n_t  = len(idx_traj)
+        i0_t = idx_traj[int(n_t * CIRCLE_TRIM_START)]
+        i1_t = idx_traj[max(0, int(n_t * (1 - CIRCLE_TRIM_END)) - 1)]
+        fit_mask = np.zeros(len(df), dtype=bool)
+        fit_mask[i0_t:i1_t+1] = True
+        fit_mask &= traj_mask
+        cx_fit, cy_fit, r_fit, rms_fit = fit_circle(
+            df.loc[fit_mask, "L_ex"].values,
+            df.loc[fit_mask, "L_ey"].values)
+        print(f"[Círculo] Centro ENU: ({cx_fit:.3f}, {cy_fit:.3f})  R={r_fit:.3f} m  RMS={rms_fit:.4f} m")
+    else:
+        cx_fit, cy_fit, r_fit, rms_fit = 0.0, 0.0, RADIUS, np.nan
 
-        # Altitud: preferir _alt (GPS absoluto), caer a -_z (NED)
-        alt_col = f"{pfx}_alt"
-        z_col   = f"{pfx}_z"
-        if alt_col in df.columns and df[alt_col].notna().any():
-            alt_vals = df[alt_col].values.astype(float)
-        elif z_col in df.columns and df[z_col].notna().any():
-            alt_vals = -df[z_col].values.astype(float) + ORIGIN_ALT
-        else:
-            alt_vals = np.full(len(df), ORIGIN_ALT)
+    ox = cx_fit + CENTER_OFFSET_X
+    oy = cy_fit + CENTER_OFFSET_Y
+    df["L_rx"] = df["L_ex"] - ox
+    df["L_ry"] = df["L_ey"] - oy
+    df["S_rx"] = df["S_ex"] - ox
+    df["S_ry"] = df["S_ey"] - oy
 
-        xr = np.full(len(df), np.nan)
-        yr = np.full(len(df), np.nan)
-        zr = np.full(len(df), np.nan)
-
-        for i in np.where(has.values)[0]:
-            lat = float(df.at[i, f"{pfx}_lat"])
-            lon = float(df.at[i, f"{pfx}_lon"])
-            alt = float(alt_vals[i])
-            if math.isfinite(lat) and math.isfinite(lon) and math.isfinite(alt):
-                xr[i], yr[i], zr[i] = gps_to_rtk(lat, lon, alt,
-                                                   X0, Y0, Z0, R_enu, theta)
-
-        # Altitud relativa al suelo (restar mínimo inicial)
-        valid_z = zr[np.isfinite(zr)]
-        if len(valid_z):
-            z_ground = np.min(valid_z[:max(1, min(20, len(valid_z)))])
-            zr = zr - z_ground
-
-        df[f"{pfx}_rx"] = xr   # norte en RTK local
-        df[f"{pfx}_ry"] = yr   # este  en RTK local
-        df[f"{pfx}_rz"] = zr   # altura sobre suelo
-
-    # Resumen de fases
-    print("[Fases]")
-    for ph in ["TAKEOFF", "POSITIONING", "TRAJECTORY", "LANDING", "UNKNOWN"]:
-        segs = phase_segments(phases, ph)
-        if not segs:
-            continue
-        total = sum(t_arr[min(i1-1, len(t_arr)-1)] - t_arr[i0] for i0, i1 in segs)
-        t0s = t_arr[segs[0][0]]
-        t1s = t_arr[min(segs[-1][1]-1, len(t_arr)-1)]
-        print(f"  {ph:<14s}: {total:6.1f} s  (t={t0s:.1f}–{t1s:.1f} s)")
-
+    print(f"[Replay] {len(df)} muestras listas para reproducir.\n")
     return df
 
 
 # =============================================================================
-# UTILIDADES DE MARKERS
+# ── NODO ROS 2 ────────────────────────────────────────────────────────────────
 # =============================================================================
 
-FRAME_ID = "rtk_odom"   # mismo que MavrosVisualizer
+# Colores RGBA para los drones
+COLOR_LEADER   = ColorRGBA(r=0.13, g=0.39, b=0.75, a=1.0)   # azul
+COLOR_FOLLOWER = ColorRGBA(r=0.78, g=0.16, b=0.16, a=1.0)   # rojo
+
+# Color elipsoide (sin modo GPS en replay, usamos verde fijo)
+COLOR_ELLIPSE = ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.25)
+
+ELLIPSE_SCALE_XY = 0.60   # radio visual del dron en XY [m]
+ELLIPSE_SCALE_Z  = 0.20   # radio visual en Z [m]
 
 
-def _stamp(node, m):
-    m.header.stamp = node.get_clock().now().to_msg()
-    return m
+def float_to_ros_time(t_float):
+    """Convierte segundos float a builtin_interfaces/Time."""
+    sec     = int(t_float)
+    nanosec = int((t_float - sec) * 1e9)
+    msg = RosTime()
+    msg.sec     = sec
+    msg.nanosec = nanosec
+    return msg
 
 
-def _lifetime_inf():
-    d = Duration(); d.sec = 0; d.nanosec = 0
-    return d
+class LogReplayNode(Node):
+    def __init__(self, df: pd.DataFrame, speed: float, loop: bool, publish_path: bool):
+        super().__init__("log_replay_rviz")
 
+        self.df           = df
+        self.speed        = speed          # factor de velocidad (0 = paso a paso)
+        self.loop         = loop
+        self.publish_path = publish_path
 
-def _rgba(r, g, b, a=1.0):
-    c = ColorRGBA()
-    c.r, c.g, c.b, c.a = float(r), float(g), float(b), float(a)
-    return c
+        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 
+        self.tf_br = TransformBroadcaster(self)
 
-def _pt(xr, yr, zr):
-    """
-    Convierte coordenadas RTK local a Point de RViz.
-    En rtk_odom: x=este (yr), y=norte (xr), z=arriba (zr)
-    """
-    p = Point()
-    p.x = float(yr)    # este
-    p.y = float(xr)    # norte
-    p.z = float(zr)
-    return p
+        # Publishers para cada dron
+        self.pubs = {}
+        for ns, color in [("uav1", COLOR_LEADER), ("uav2", COLOR_FOLLOWER)]:
+            self.pubs[ns] = {
+                "odom":   self.create_publisher(Odometry, f"/{ns}/gps/odom",        qos),
+                "path":   self.create_publisher(Path,     f"/{ns}/gps/drone_path",  qos),
+                "marker": self.create_publisher(Marker,   f"/{ns}/gps/drone_marker", qos),
+                "color":  color,
+                "path_msg": self._empty_path(),
+            }
 
+        self.idx = 0
+        self.t_arr = df["t"].values
 
-def make_line_list(mid, ns, color_rgba, scale):
-    m = Marker()
-    m.header.frame_id = FRAME_ID
-    m.ns, m.id = ns, mid
-    m.type   = Marker.LINE_LIST
-    m.action = Marker.ADD
-    m.scale.x = float(scale)
-    m.color   = _rgba(*color_rgba)
-    m.lifetime = _lifetime_inf()
-    m.pose.orientation.w = 1.0
-    return m
+        # Timer de reproducción (se ajusta dinámicamente según dt real del log)
+        # Usamos un timer rápido y controlamos el tiempo internamente
+        self._replay_active = True
+        self._last_wall     = None
+        self._last_log_t    = None
 
+        # Disparar la reproducción en un timer de 10 ms
+        self.timer = self.create_timer(0.01, self._step_cb)
 
-def make_sphere(mid, ns, color_rgba, scale, xr, yr, zr):
-    m = Marker()
-    m.header.frame_id = FRAME_ID
-    m.ns, m.id = ns, mid
-    m.type   = Marker.SPHERE
-    m.action = Marker.ADD
-    m.scale.x = m.scale.y = m.scale.z = float(scale)
-    m.color   = _rgba(*color_rgba)
-    m.lifetime = _lifetime_inf()
-    m.pose.orientation.w = 1.0
-    m.pose.position = _pt(xr, yr, zr)
-    return m
-
-
-def make_cube(mid, ns, color_rgba, sx, sy, sz, xr, yr, zr):
-    m = Marker()
-    m.header.frame_id = FRAME_ID
-    m.ns, m.id = ns, mid
-    m.type   = Marker.CUBE
-    m.action = Marker.ADD
-    m.scale.x, m.scale.y, m.scale.z = float(sx), float(sy), float(sz)
-    m.color   = _rgba(*color_rgba)
-    m.lifetime = _lifetime_inf()
-    m.pose.orientation.w = 1.0
-    m.pose.position = _pt(xr, yr, zr)
-    return m
-
-
-def make_text(mid, ns, text, xr, yr, zr, scale=0.45):
-    m = Marker()
-    m.header.frame_id = FRAME_ID
-    m.ns, m.id = ns, mid
-    m.type   = Marker.TEXT_VIEW_FACING
-    m.action = Marker.ADD
-    m.text   = text
-    m.scale.z = float(scale)
-    m.color   = _rgba(1.0, 1.0, 1.0, 0.95)
-    m.lifetime = _lifetime_inf()
-    m.pose.orientation.w = 1.0
-    m.pose.position = _pt(xr, yr, zr)
-    return m
-
-
-def make_circle_strip(mid, ns, color_rgba, scale, radius, z_h, n=180):
-    """Círculo teórico como LINE_STRIP."""
-    m = Marker()
-    m.header.frame_id = FRAME_ID
-    m.ns, m.id = ns, mid
-    m.type   = Marker.LINE_STRIP
-    m.action = Marker.ADD
-    m.scale.x = float(scale)
-    m.color   = _rgba(*color_rgba)
-    m.lifetime = _lifetime_inf()
-    m.pose.orientation.w = 1.0
-    theta = np.linspace(0.0, 2.0 * math.pi, n)
-    for th in theta:
-        # radio en plano XY del frame RTK (norte=x, este=y)
-        xr_c = radius * math.cos(th)
-        yr_c = radius * math.sin(th)
-        m.points.append(_pt(xr_c, yr_c, z_h))
-    return m
-
-
-# =============================================================================
-# NODO ROS2
-# =============================================================================
-
-class ReplayNode(Node):
-
-    def __init__(self, df, speed):
-        super().__init__("rviz_replay")
-
-        qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
-        self._pub_traj    = self.create_publisher(MarkerArray, "/replay/trajectory",      qos)
-        self._pub_current = self.create_publisher(MarkerArray, "/replay/current_pos",     qos)
-        self._pub_static  = self.create_publisher(MarkerArray, "/replay/static_markers",  qos)
-        self._pub_label   = self.create_publisher(MarkerArray, "/replay/phase_label",     qos)
-
-        self._df     = df
-        self._speed  = speed
-        self._t_arr  = df["t"].values
-        self._phases = df["phase"].values
-
-        # Pre-construir segmentos para el loop animado
-        self._segs = self._build_segments()
-
-        # Publicar estáticos una vez al arrancar
-        self._publish_static()
-
-        self._stop   = threading.Event()
-        self._thread = threading.Thread(target=self._replay_loop, daemon=True)
-        self._thread.start()
-
-        dur = self._t_arr[-1] - self._t_arr[0]
         self.get_logger().info(
-            f"Replay iniciado | speed={speed}x | duración={dur:.1f} s | "
-            f"frame={FRAME_ID}"
-        )
-        self.get_logger().info(
-            "Tópicos:\n"
-            "  /replay/trajectory      — trayectoria acumulada\n"
-            "  /replay/current_pos     — posición actual animada\n"
-            "  /replay/static_markers  — inicio ★  CI ●  SP ■\n"
-            "  /replay/phase_label     — fase y tiempo"
+            f"LogReplayNode listo | {len(df)} muestras | "
+            f"speed={speed if speed > 0 else 'paso-a-paso'} | loop={loop}"
         )
 
-    # ── Pre-compómputo de segmentos ───────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _build_segments(self):
-        """
-        Lista de (i_start, i_end, pfx, phase) con límites en cambios de fase.
-        """
-        df = self._df; phases = self._phases; n = len(df)
-        segs = []
-        for pfx in ("L", "S"):
-            rx = df[f"{pfx}_rx"].values
-            ry = df[f"{pfx}_ry"].values
-            rz = df[f"{pfx}_rz"].values
-            i = 0
-            while i < n - 1:
-                ph = phases[i]; j = i + 1
-                while (j < n and phases[j] == ph
-                       and np.isfinite(rx[j]) and np.isfinite(ry[j])):
-                    j += 1
-                valid = np.isfinite(rx[i:j]) & np.isfinite(ry[i:j])
-                if valid.sum() >= 2:
-                    segs.append((i, j, pfx, ph))
-                i = j
-        return segs
+    def _empty_path(self):
+        p = Path()
+        p.header.frame_id = "rtk_odom"
+        return p
 
-    # ── Marcadores estáticos ──────────────────────────────────────────────────
+    def _ros_now_from_log_t(self, log_t: float):
+        """Usa el tiempo del log como stamp (para que RViz muestre el tiempo real del vuelo)."""
+        return float_to_ros_time(log_t)
 
-    def _publish_static(self):
-        df     = self._df
-        phases = self._phases
-        arr    = MarkerArray()
-        mid    = 0
+    def _publish_drone(self, ns: str, x: float, y: float, z: float,
+                       quat: Quaternion, stamp: RosTime):
+        pubs  = self.pubs[ns]
+        color = pubs["color"]
 
-        def add(m):
-            m.header.stamp = self.get_clock().now().to_msg()
-            arr.markers.append(m)
-            return m
+        # ── TF base_link ──────────────────────────────────────────────────────
+        tf = TransformStamped()
+        tf.header.stamp          = stamp
+        tf.header.frame_id       = "rtk_odom"
+        tf.child_frame_id        = f"{ns}_base_link"
+        tf.transform.translation.x = x
+        tf.transform.translation.y = y
+        tf.transform.translation.z = z
+        tf.transform.rotation       = quat
+        self.tf_br.sendTransform(tf)
 
-        # Altura media de la fase TRAJECTORY (para los círculos teóricos)
-        traj_mask = phases == "TRAJECTORY"
-        z_traj_L = float(np.nanmean(df.loc[traj_mask, "L_rz"])) if traj_mask.any() else 4.0
-        z_traj_S = float(np.nanmean(df.loc[traj_mask, "S_rz"])) if traj_mask.any() else 5.0
+        # ── TF base_footprint ─────────────────────────────────────────────────
+        tf2 = TransformStamped()
+        tf2.header.stamp          = stamp
+        tf2.header.frame_id       = "rtk_odom"
+        tf2.child_frame_id        = f"{ns}_base_footprint"
+        tf2.transform.translation.x = x
+        tf2.transform.translation.y = y
+        tf2.transform.translation.z = 0.0
+        tf2.transform.rotation.w    = 1.0
+        self.tf_br.sendTransform(tf2)
 
-        # Círculos teóricos
-        add(make_circle_strip(mid, "theory_leader",
-                              (0.70, 0.70, 0.70, 0.40), 0.025, RADIUS, z_traj_L))
-        mid += 1
-        add(make_circle_strip(mid, "theory_follower",
-                              (0.90, 0.55, 0.55, 0.38), 0.025, RADIUS + OFFSET_D, z_traj_S))
-        mid += 1
+        # ── Odometry ──────────────────────────────────────────────────────────
+        odom = Odometry()
+        odom.header.stamp    = stamp
+        odom.header.frame_id = "rtk_odom"
+        odom.child_frame_id  = f"{ns}_base_link"
+        odom.pose.pose.position.x    = x
+        odom.pose.pose.position.y    = y
+        odom.pose.pose.position.z    = z
+        odom.pose.pose.orientation   = quat
+        pubs["odom"].publish(odom)
 
-        COLOR = {"L": COLOR_LEADER, "S": COLOR_FOLLOWER}
-        LABEL = {"L": "Líder", "S": "Seguidor"}
+        # ── Path ──────────────────────────────────────────────────────────────
+        if self.publish_path:
+            ps = PoseStamped()
+            ps.header = odom.header
+            ps.pose   = odom.pose.pose
+            pubs["path_msg"].header.stamp = stamp
+            pubs["path_msg"].poses.append(ps)
+            pubs["path"].publish(pubs["path_msg"])
 
-        for pfx in ("L", "S"):
-            rx = df[f"{pfx}_rx"].values
-            ry = df[f"{pfx}_ry"].values
-            rz = df[f"{pfx}_rz"].values
-            color = COLOR[pfx]
-            label = LABEL[pfx]
+        # ── Marker texto ──────────────────────────────────────────────────────
+        text = Marker()
+        text.header    = odom.header
+        text.ns        = f"{ns}_text"
+        text.id        = 0
+        text.type      = Marker.TEXT_VIEW_FACING
+        text.action    = Marker.ADD
+        text.pose.position.x = x
+        text.pose.position.y = y
+        text.pose.position.z = z + 0.8
+        text.pose.orientation.w = 1.0
+        text.scale.z = 0.4
+        text.color   = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
+        text.text    = f"{ns}: x={x:.2f}  y={y:.2f}  z={z:.2f}"
+        pubs["marker"].publish(text)
 
-            # Primer punto válido → inicio ★
-            valid_idx = np.where(np.isfinite(rx) & np.isfinite(ry))[0]
-            if len(valid_idx):
-                i0 = valid_idx[0]
-                z0 = rz[i0] if np.isfinite(rz[i0]) else 0.0
-                add(make_sphere(mid, f"start_{pfx}", color, SPHERE_START,
-                                rx[i0], ry[i0], z0))
-                mid += 1
-                add(make_text(mid, f"start_lbl_{pfx}",
-                              f"★ Inicio {label}",
-                              rx[i0], ry[i0], z0 + 0.6))
-                mid += 1
+        # ── Marker esfera (elipsoide de posición) ─────────────────────────────
+        ell = Marker()
+        ell.header = odom.header
+        ell.ns     = f"{ns}_ellipse"
+        ell.id     = 1
+        ell.type   = Marker.SPHERE
+        ell.action = Marker.ADD
+        ell.pose.position.x = x
+        ell.pose.position.y = y
+        ell.pose.position.z = z
+        ell.pose.orientation.w = 1.0
+        ell.scale.x = 2.0 * ELLIPSE_SCALE_XY
+        ell.scale.y = 2.0 * ELLIPSE_SCALE_XY
+        ell.scale.z = 2.0 * ELLIPSE_SCALE_Z
+        ell.color   = COLOR_ELLIPSE
+        # Tint según dron: líder verde, seguidor naranja
+        if ns == "uav1":
+            ell.color = ColorRGBA(r=0.0, g=0.8, b=0.2, a=0.30)
+        else:
+            ell.color = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.30)
+        pubs["marker"].publish(ell)
 
-            # Condición inicial TRAJECTORY → CI ●
-            traj_idx = np.where(phases == "TRAJECTORY")[0]
-            if len(traj_idx):
-                i_ci = traj_idx[0]
-                if np.isfinite(rx[i_ci]) and np.isfinite(ry[i_ci]):
-                    z_ci = rz[i_ci] if np.isfinite(rz[i_ci]) else 0.0
-                    add(make_sphere(mid, f"ci_{pfx}",
-                                   (*color[:3], 0.85), SPHERE_CI,
-                                   rx[i_ci], ry[i_ci], z_ci))
-                    mid += 1
-                    add(make_text(mid, f"ci_lbl_{pfx}",
-                                  f"● CI {label}",
-                                  rx[i_ci], ry[i_ci], z_ci + 0.5, 0.32))
-                    mid += 1
+    # ── Timer callback ────────────────────────────────────────────────────────
 
-            # SP de preposicionamiento → cubo ■
-            sp = SP_PREPOS.get(pfx)
-            if sp is not None:
-                add(make_cube(mid, f"sp_{pfx}",
-                              (*color[:3], 0.70),
-                              CUBE_SP, CUBE_SP, CUBE_SP * 0.3,
-                              sp["x"], sp["y"], sp["z"]))
-                mid += 1
-                add(make_text(mid, f"sp_lbl_{pfx}",
-                              f"■ SP {label}",
-                              sp["x"], sp["y"], sp["z"] + 0.45, 0.30))
-                mid += 1
+    def _step_cb(self):
+        if not self._replay_active:
+            return
 
-        self._pub_static.publish(arr)
-        self.get_logger().info(f"Marcadores estáticos: {mid} publicados")
+        df   = self.df
+        idx  = self.idx
+        n    = len(df)
 
-    # ── Loop animado ──────────────────────────────────────────────────────────
+        if idx >= n:
+            if self.loop:
+                self.get_logger().info("[Replay] Reiniciando (--loop)…")
+                self.idx = 0
+                for ns in self.pubs:
+                    self.pubs[ns]["path_msg"] = self._empty_path()
+                self._last_wall  = None
+                self._last_log_t = None
+                return
+            else:
+                self.get_logger().info("[Replay] Fin del log. Ctrl+C para salir.")
+                self._replay_active = False
+                self.timer.cancel()
+                return
 
-    def _replay_loop(self):
-        df      = self._df
-        t_arr   = self._t_arr
-        phases  = self._phases
-        speed   = self._speed
-        dt_pub  = 1.0 / PUBLISH_RATE
+        log_t = float(self.t_arr[idx])
+        wall  = time.monotonic()
 
-        t_start_data = float(t_arr[0])
-        t_end_data   = float(t_arr[-1])
-        t_wall_start = time.monotonic()
+        # Control de tiempo real simulado
+        if self.speed > 0:
+            if self._last_wall is not None:
+                dt_log  = log_t - self._last_log_t          # dt en el log
+                dt_wall = wall  - self._last_wall            # dt real transcurrido
+                dt_needed = dt_log / self.speed              # dt que debería haber pasado
 
-        COLOR = {"L": COLOR_LEADER, "S": COLOR_FOLLOWER}
+                if dt_wall < dt_needed:
+                    return   # aún no es el momento de publicar este sample
+        # speed == 0: paso a paso — se publica y luego espera el Enter en el main
 
-        while not self._stop.is_set():
-            t_wall = time.monotonic()
-            t_data = t_start_data + (t_wall - t_wall_start) * speed
-            t_data = min(t_data, t_end_data)
+        row = df.iloc[idx]
 
-            i_now = int(np.searchsorted(t_arr, t_data, side="right")) - 1
-            i_now = max(0, min(i_now, len(t_arr) - 1))
+        # Extraer posiciones ya transformadas (L_rx, L_ry, L_cz, S_rx, S_ry, S_cz)
+        lx = float(row["L_rx"]) if not np.isnan(row["L_rx"]) else 0.0
+        ly = float(row["L_ry"]) if not np.isnan(row["L_ry"]) else 0.0
+        lz = float(row["L_cz"]) if not np.isnan(row["L_cz"]) else 0.0
+        sx = float(row["S_rx"]) if not np.isnan(row["S_rx"]) else 0.0
+        sy = float(row["S_ry"]) if not np.isnan(row["S_ry"]) else 0.0
+        sz = float(row["S_cz"]) if not np.isnan(row["S_cz"]) else 0.0
 
-            stamp = self.get_clock().now().to_msg()
+        # Orientación: usar columnas de cuaternión si existen, si no identidad
+        def get_quat(pfx):
+            q = Quaternion()
+            q.w = 1.0
+            for field, col in [("x", f"{pfx}_qx"), ("y", f"{pfx}_qy"),
+                                ("z", f"{pfx}_qz"), ("w", f"{pfx}_qw")]:
+                if col in df.columns and not np.isnan(row[col]):
+                    setattr(q, field, float(row[col]))
+            return q
 
-            # ── Trayectoria acumulada ─────────────────────────────────────────
-            traj_arr = MarkerArray()
-            mid = 0
+        stamp = self._ros_now_from_log_t(log_t)
 
-            for pfx in ("L", "S"):
-                color_base = COLOR[pfx]
-                rx = df[f"{pfx}_rx"].values
-                ry = df[f"{pfx}_ry"].values
-                rz = df[f"{pfx}_rz"].values
+        self._publish_drone("uav1", lx, ly, lz, get_quat("L"), stamp)
+        self._publish_drone("uav2", sx, sy, sz, get_quat("S"), stamp)
 
-                for (i0, i1, seg_pfx, ph) in self._segs:
-                    if seg_pfx != pfx or i0 > i_now:
-                        continue
-                    i1_clip = min(i1, i_now + 1)
-                    scale, alpha = PHASE_VIZ.get(ph, (0.015, 0.20))
+        self._last_wall  = wall
+        self._last_log_t = log_t
+        self.idx += 1
 
-                    m = make_line_list(mid, f"traj_{pfx}_{ph}",
-                                      (*color_base[:3], alpha), scale)
-                    m.header.stamp = stamp
-
-                    for k in range(i0, i1_clip - 1):
-                        if (np.isfinite(rx[k])   and np.isfinite(ry[k])
-                                and np.isfinite(rz[k])
-                                and np.isfinite(rx[k+1]) and np.isfinite(ry[k+1])
-                                and np.isfinite(rz[k+1])):
-                            m.points.append(_pt(rx[k],   ry[k],   rz[k]))
-                            m.points.append(_pt(rx[k+1], ry[k+1], rz[k+1]))
-
-                    if m.points:
-                        traj_arr.markers.append(m)
-                    mid += 1
-
-            self._pub_traj.publish(traj_arr)
-
-            # ── Posición actual (esferas animadas) ────────────────────────────
-            curr_arr = MarkerArray()
-            cid = 0
-            for pfx in ("L", "S"):
-                rx = df[f"{pfx}_rx"].values
-                ry = df[f"{pfx}_ry"].values
-                rz = df[f"{pfx}_rz"].values
-                color = COLOR[pfx]
-
-                x_c = rx[i_now] if np.isfinite(rx[i_now]) else 0.0
-                y_c = ry[i_now] if np.isfinite(ry[i_now]) else 0.0
-                z_c = rz[i_now] if np.isfinite(rz[i_now]) else 0.0
-
-                m_c = make_sphere(cid, f"current_{pfx}",
-                                  (*color[:3], 0.95), SPHERE_CURRENT,
-                                  x_c, y_c, z_c)
-                m_c.header.stamp = stamp
-                curr_arr.markers.append(m_c)
-                cid += 1
-
-            self._pub_current.publish(curr_arr)
-
-            # ── Etiqueta fase + tiempo ────────────────────────────────────────
-            ph_now  = phases[i_now]
-            lbl_str = PHASE_LABEL.get(ph_now, ph_now)
-            t_rel   = t_data - t_start_data
-
-            rx_L = df["L_rx"].values; ry_L = df["L_ry"].values
-            rz_L = df["L_rz"].values
-            x_lbl = rx_L[i_now] if np.isfinite(rx_L[i_now]) else 0.0
-            y_lbl = ry_L[i_now] if np.isfinite(ry_L[i_now]) else 0.0
-            z_lbl = (rz_L[i_now] if np.isfinite(rz_L[i_now]) else 0.0) + 1.3
-
-            lbl_arr = MarkerArray()
-            m_lbl = make_text(0, "phase_label",
-                              f"{lbl_str}\nt = {t_rel:.1f} s",
-                              x_lbl, y_lbl, z_lbl, scale=0.45)
-            m_lbl.header.stamp = stamp
-            lbl_arr.markers.append(m_lbl)
-            self._pub_label.publish(lbl_arr)
-
-            # ── Sleep exacto ──────────────────────────────────────────────────
-            sleep_t = dt_pub - (time.monotonic() - t_wall)
-            if sleep_t > 0:
-                time.sleep(sleep_t)
-
-            if t_data >= t_end_data:
-                self.get_logger().info("Reproducción completada — trayectoria estática activa.")
-                break
-
-    def stop(self):
-        self._stop.set()
+        # Log de progreso cada 10 s simulados
+        if idx % 200 == 0:
+            self.get_logger().info(
+                f"[Replay] t={log_t:.1f} s  idx={idx}/{n}  "
+                f"fase={row.get('phase','?')}  "
+                f"L=({lx:.2f},{ly:.2f},{lz:.2f})  S=({sx:.2f},{sy:.2f},{sz:.2f})"
+            )
 
 
 # =============================================================================
-# MAIN
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 # =============================================================================
 
 def main():
-    global ORIGIN_LAT, ORIGIN_LON, ORIGIN_ALT, CALIB_ANG_DEG, PLAYBACK_SPEED
-
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--master",     default=CSV_FILE,
+    ap.add_argument("--master",   default=CSV_FILE,
                     help=f"CSV de telemetría (default: {CSV_FILE})")
-    ap.add_argument("--speed",      type=float, default=PLAYBACK_SPEED,
-                    help="Factor de velocidad (default: %(default)s)")
-    ap.add_argument("--origin_lat", type=float, default=ORIGIN_LAT,
-                    help="Latitud origen RTK (default: %(default)s)")
-    ap.add_argument("--origin_lon", type=float, default=ORIGIN_LON,
-                    help="Longitud origen RTK (default: %(default)s)")
-    ap.add_argument("--origin_alt", type=float, default=ORIGIN_ALT,
-                    help="Altitud origen RTK m (default: %(default)s)")
-    ap.add_argument("--calib_ang",  type=float, default=CALIB_ANG_DEG,
-                    help="Ángulo calibración CCW deg (default: %(default)s)")
+    ap.add_argument("--speed",    type=float, default=1.0,
+                    help="Factor de velocidad (1.0 = tiempo real, 2.0 = doble, 0 = paso a paso)")
+    ap.add_argument("--loop",     action="store_true",
+                    help="Repetir el log al terminar")
+    ap.add_argument("--no-path",  action="store_true",
+                    help="No publicar Path (útil para logs muy largos)")
+    ap.add_argument("--ox",  type=float, default=None)
+    ap.add_argument("--oy",  type=float, default=None)
+    ap.add_argument("--ozl", type=float, default=None)
+    ap.add_argument("--ozs", type=float, default=None)
     args = ap.parse_args()
 
-    ORIGIN_LAT    = args.origin_lat
-    ORIGIN_LON    = args.origin_lon
-    ORIGIN_ALT    = args.origin_alt
-    CALIB_ANG_DEG = args.calib_ang
-    PLAYBACK_SPEED = args.speed
-
-    # ── Pre-cálculo del origen (igual que MultiDroneVisualizer.__init__) ──────
-    lat0_r = math.radians(ORIGIN_LAT)
-    lon0_r = math.radians(ORIGIN_LON)
-    X0, Y0, Z0 = geodetic_to_ecef(lat0_r, lon0_r, ORIGIN_ALT)
-    R_enu  = get_rotation_matrix(lat0_r, lon0_r)
-    theta  = math.radians(CALIB_ANG_DEG)
-
-    print(f"\n[Config] Origen RTK: lat={ORIGIN_LAT:.7f}  lon={ORIGIN_LON:.7f}  "
-          f"alt={ORIGIN_ALT:.1f} m")
-    print(f"[Config] calib_ang={CALIB_ANG_DEG:.1f}°  speed={PLAYBACK_SPEED}x")
+    global CENTER_OFFSET_X, CENTER_OFFSET_Y
+    global CENTER_OFFSET_Z_LEADER, CENTER_OFFSET_Z_FOLLOWER
+    if args.ox  is not None: CENTER_OFFSET_X          = args.ox
+    if args.oy  is not None: CENTER_OFFSET_Y          = args.oy
+    if args.ozl is not None: CENTER_OFFSET_Z_LEADER   = args.ozl
+    if args.ozs is not None: CENTER_OFFSET_Z_FOLLOWER = args.ozs
 
     try:
-        df = load_data(args.master, X0, Y0, Z0, R_enu, theta)
+        df = load_and_transform(args.master)
     except FileNotFoundError:
-        print(f"\n[ERROR] No se encontró '{args.master}'")
-        print("        Usa --master /ruta/al/archivo.csv")
-        sys.exit(1)
-    except KeyError as e:
-        print(f"\n[ERROR] Columna no encontrada en el CSV: {e}")
+        print(f"\n[ERROR] No se encontró '{args.master}'\n"
+              f"        Usa --master /ruta/al/archivo.csv")
         sys.exit(1)
 
     rclpy.init()
-    node = ReplayNode(df, args.speed)
 
-    print("\n══════════════════════════════════════════════════════")
-    print("  En RViz2 (Fixed Frame: rtk_odom):")
-    print("    Add → By topic → /replay/trajectory      → MarkerArray")
-    print("    Add → By topic → /replay/current_pos     → MarkerArray")
-    print("    Add → By topic → /replay/static_markers  → MarkerArray")
-    print("    Add → By topic → /replay/phase_label     → MarkerArray")
-    print("══════════════════════════════════════════════════════\n")
+    if args.speed == 0:
+        # Modo paso a paso interactivo
+        node = LogReplayNode(df, speed=0, loop=args.loop,
+                             publish_path=not args.no_path)
+        print("\n[Paso-a-paso] Pulsa Enter para publicar cada muestra. Ctrl+C para salir.\n")
+        try:
+            while rclpy.ok() and node._replay_active:
+                input()        # espera Enter
+                node._step_cb()
+                rclpy.spin_once(node, timeout_sec=0.01)
+        except KeyboardInterrupt:
+            pass
+    else:
+        node = LogReplayNode(df, speed=args.speed, loop=args.loop,
+                             publish_path=not args.no_path)
+        try:
+            rclpy.spin(node)
+        except KeyboardInterrupt:
+            pass
 
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        print("\n[INFO] Detenido por usuario.")
-    finally:
-        node.stop()
-        node.destroy_node()
-        rclpy.shutdown()
+    node.destroy_node()
+    rclpy.shutdown()
+    print("\n✅ Replay terminado.")
 
 
 if __name__ == "__main__":
