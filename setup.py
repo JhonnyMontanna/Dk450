@@ -35,6 +35,7 @@ setup(
             'Mavros_ControlLF = dk450.Mavros_ControlLF:main', 
             'Mavros_Graficas = dk450.Mavros_Graficas:main',
             'Mavros_Master = dk450.Mavros_Master:main',
+            'Mavros_Replay = dk450.ReplayRviz:main',
 
         ],
     },

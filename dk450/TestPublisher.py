@@ -4,6 +4,19 @@ Corre esto EN TU MÁQUINA con ROS 2 activo:
 
 Mide cuánto tarda cada publish() y sendTransform() para saber
 si el cuello de botella es ROS middleware o el código Python.
+
+
+Benchmarking 500 iteraciones (2x odom + 2x marker + 2x TF por iter)...
+
+Resultados:
+  Tiempo total:        0.159 s para 500 iters
+  Tiempo por muestra:  0.317 ms
+  Throughput máximo:   3150 muestras/s
+
+Implicaciones:
+  A 10 Hz (log típico): speed máximo alcanzable = 315x
+  A 50 Hz (log rápido): speed máximo alcanzable = 63x
+
 """
 import time
 import rclpy
