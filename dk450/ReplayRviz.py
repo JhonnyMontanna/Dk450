@@ -2,20 +2,20 @@
 """
 log_replay_rviz.py
 ==================
-Reproduce un log CSV (master_telemetry.csv) en RViz en "tiempo real" simulado.
+Reproduce un log CSV (master_telemetry.csv) en RViz en tiempo real simulado.
 
 Combina:
   · La lógica de transformación ENU + offsets de ReplayTotal.py
   · Los publishers/TF/Markers de MavrosVisualizer.py
 
 Drones publicados:
-  · uav1  — Líder   (azul en RViz)
-  · uav2  — Seguidor (rojo en RViz)
+  · uav1  — Líder
+  · uav2  — Seguidor
 
-Topics publicados por dron (mismo esquema que MavrosVisualizer):
+Topics publicados por dron:
   /{ns}/gps/odom            nav_msgs/Odometry
   /{ns}/gps/drone_path      nav_msgs/Path
-  /{ns}/gps/drone_marker    visualization_msgs/Marker  (texto + esfera)
+  /{ns}/gps/drone_marker    visualization_msgs/Marker (texto + esfera)
   TF:  rtk_odom → {ns}_base_link
        rtk_odom → {ns}_base_footprint
 
@@ -23,19 +23,19 @@ USO:
   python log_replay_rviz.py
   python log_replay_rviz.py --master vuelo1.csv
   python log_replay_rviz.py --master vuelo1.csv --speed 2.0 --loop
-  python log_replay_rviz.py --master vuelo1.csv --speed 0  # paso a paso
+  python log_replay_rviz.py --master vuelo1.csv --speed 0.5
 
-PARÁMETROS CLAVE:
-  --master   CSV de telemetría  (default: master_telemetry.csv)
-  --speed    Factor de velocidad de reproducción  (default: 1.0)
-             0 = paso a paso (pulsa Enter para avanzar)
-  --loop     Repetir indefinidamente al terminar
-  --no-path  No publicar los Path (útil si el log es muy largo)
+PARÁMETROS:
+  --master   CSV de telemetría        (default: master_telemetry.csv)
+  --speed    Factor de velocidad      (default: 1.0 = tiempo real, 2.0 = doble)
+  --loop     Repetir al terminar
+  --no-path  No publicar Path (logs muy largos)
 """
 
 import sys
 import math
 import time
+import threading
 import argparse
 
 import numpy as np
@@ -54,12 +54,11 @@ from builtin_interfaces.msg import Time as RosTime
 
 
 # =============================================================================
-# ── CONFIGURACIÓN (igual que ReplayTotal.py) ──────────────────────────────────
+# CONFIGURACIÓN — ajustar igual que en ReplayTotal.py
 # =============================================================================
 
 CSV_FILE = "master_telemetry.csv"
 
-# Fases de vuelo  ← ajustar igual que en ReplayTotal
 PHASE_TIMES = {
     "TAKEOFF":     (0.0,    35.0),
     "POSITIONING": (35.0,   75.0),
@@ -67,22 +66,25 @@ PHASE_TIMES = {
     "LANDING":     (150.0,  None),
 }
 
-R_EARTH  = 6_371_000.0
-RADIUS   = 4.0
-OFFSET_D = 2.0
+R_EARTH   = 6_371_000.0
+RADIUS    = 4.0
+OFFSET_D  = 2.0
 OFFSET_DZ = 1.0
 
-CENTER_OFFSET_X          =  0.0
-CENTER_OFFSET_Y          =  0.0
-CENTER_OFFSET_Z_LEADER   =  0.0
-CENTER_OFFSET_Z_FOLLOWER =  0.0
+CENTER_OFFSET_X          = 0.0
+CENTER_OFFSET_Y          = 0.0
+CENTER_OFFSET_Z_LEADER   = 0.0
+CENTER_OFFSET_Z_FOLLOWER = 0.0
 
 CIRCLE_TRIM_START = 0.10
 CIRCLE_TRIM_END   = 0.05
 
+ELLIPSE_SCALE_XY = 0.60   # radio visual dron XY [m]
+ELLIPSE_SCALE_Z  = 0.20   # radio visual dron Z  [m]
+
 
 # =============================================================================
-# ── UTILIDADES (de ReplayTotal.py) ────────────────────────────────────────────
+# TRANSFORMACIÓN ENU (de ReplayTotal.py)
 # =============================================================================
 
 def gps_to_enu(lat, lon, ref_lat, ref_lon):
@@ -117,23 +119,8 @@ def assign_phases(t_arr, phase_times):
             continue
         t0, t1 = interval
         t1 = t_max if t1 is None else t1
-        mask = (t_arr >= t0) & (t_arr <= t1)
-        phases[mask] = name
+        phases[(t_arr >= t0) & (t_arr <= t1)] = name
     return phases
-
-
-def phase_segments(phases, label):
-    segs, n, i = [], len(phases), 0
-    while i < n:
-        if phases[i] == label:
-            j = i
-            while j < n and phases[j] == label:
-                j += 1
-            segs.append((i, j))
-            i = j
-        else:
-            i += 1
-    return segs
 
 
 def load_and_transform(path):
@@ -142,7 +129,6 @@ def load_and_transform(path):
     df = df.sort_values("t").reset_index(drop=True)
     print(f"     {len(df)} filas · {len(df.columns)} columnas")
 
-    # Origen ENU
     mask_gps = df["L_lat"].notna() & df["L_lon"].notna()
     if not mask_gps.any():
         raise ValueError("No hay GPS del líder (L_lat/L_lon) en el CSV.")
@@ -182,7 +168,6 @@ def load_and_transform(path):
     phases = assign_phases(t_arr, PHASE_TIMES)
     df["phase"] = phases
 
-    # Ajuste círculo
     traj_mask = phases == "TRAJECTORY"
     if traj_mask.sum() > 10:
         idx_traj = np.where(traj_mask)[0]
@@ -195,7 +180,8 @@ def load_and_transform(path):
         cx_fit, cy_fit, r_fit, rms_fit = fit_circle(
             df.loc[fit_mask, "L_ex"].values,
             df.loc[fit_mask, "L_ey"].values)
-        print(f"[Círculo] Centro ENU: ({cx_fit:.3f}, {cy_fit:.3f})  R={r_fit:.3f} m  RMS={rms_fit:.4f} m")
+        print(f"[Círculo] Centro ENU: ({cx_fit:.3f}, {cy_fit:.3f})  "
+              f"R={r_fit:.3f} m  RMS={rms_fit:.4f} m")
     else:
         cx_fit, cy_fit, r_fit, rms_fit = 0.0, 0.0, RADIUS, np.nan
 
@@ -206,259 +192,230 @@ def load_and_transform(path):
     df["S_rx"] = df["S_ex"] - ox
     df["S_ry"] = df["S_ey"] - oy
 
-    print(f"[Replay] {len(df)} muestras listas para reproducir.\n")
+    print(f"[Replay] {len(df)} muestras listas.\n")
     return df
 
 
 # =============================================================================
-# ── NODO ROS 2 ────────────────────────────────────────────────────────────────
+# NODO ROS 2
 # =============================================================================
 
-# Colores RGBA para los drones
-COLOR_LEADER   = ColorRGBA(r=0.13, g=0.39, b=0.75, a=1.0)   # azul
-COLOR_FOLLOWER = ColorRGBA(r=0.78, g=0.16, b=0.16, a=1.0)   # rojo
-
-# Color elipsoide (sin modo GPS en replay, usamos verde fijo)
-COLOR_ELLIPSE = ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.25)
-
-ELLIPSE_SCALE_XY = 0.60   # radio visual del dron en XY [m]
-ELLIPSE_SCALE_Z  = 0.20   # radio visual en Z [m]
-
-
-def float_to_ros_time(t_float):
-    """Convierte segundos float a builtin_interfaces/Time."""
-    sec     = int(t_float)
-    nanosec = int((t_float - sec) * 1e9)
+def secs_to_ros_time(t: float) -> RosTime:
     msg = RosTime()
-    msg.sec     = sec
-    msg.nanosec = nanosec
+    msg.sec     = int(t)
+    msg.nanosec = int((t - int(t)) * 1e9)
     return msg
 
 
 class LogReplayNode(Node):
+
     def __init__(self, df: pd.DataFrame, speed: float, loop: bool, publish_path: bool):
         super().__init__("log_replay_rviz")
 
         self.df           = df
-        self.speed        = speed          # factor de velocidad (0 = paso a paso)
+        self.speed        = speed
         self.loop         = loop
         self.publish_path = publish_path
 
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
-
         self.tf_br = TransformBroadcaster(self)
 
-        # Publishers para cada dron
         self.pubs = {}
-        for ns, color in [("uav1", COLOR_LEADER), ("uav2", COLOR_FOLLOWER)]:
+        for ns, ellipse_color in [
+            ("uav1", ColorRGBA(r=0.0,  g=0.85, b=0.2,  a=0.30)),
+            ("uav2", ColorRGBA(r=1.0,  g=0.50, b=0.0,  a=0.30)),
+        ]:
             self.pubs[ns] = {
-                "odom":   self.create_publisher(Odometry, f"/{ns}/gps/odom",        qos),
-                "path":   self.create_publisher(Path,     f"/{ns}/gps/drone_path",  qos),
-                "marker": self.create_publisher(Marker,   f"/{ns}/gps/drone_marker", qos),
-                "color":  color,
-                "path_msg": self._empty_path(),
+                "odom":     self.create_publisher(Odometry, f"/{ns}/gps/odom",         qos),
+                "path":     self.create_publisher(Path,     f"/{ns}/gps/drone_path",   qos),
+                "marker":   self.create_publisher(Marker,   f"/{ns}/gps/drone_marker", qos),
+                "ell_color": ellipse_color,
+                "path_msg":  self._empty_path(),
             }
 
-        self.idx = 0
-        self.t_arr = df["t"].values
+        # Hilo de reproducción independiente del executor de ROS
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._replay_loop, daemon=True)
+        self._thread.start()
 
-        self._replay_active = True
-        # Origen absoluto: se fija al publicar el primer sample
-        self._wall_origin  = None   # time.monotonic() del primer sample
-        self._log_t_origin = None   # t del log en el primer sample
-
-        # Disparar la reproducción en un timer de 10 ms
-        self.timer = self.create_timer(0.01, self._step_cb)
-
-        self.get_logger().info(
-            f"LogReplayNode listo | {len(df)} muestras | "
-            f"speed={speed if speed > 0 else 'paso-a-paso'} | loop={loop}"
-        )
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # ── helpers ───────────────────────────────────────────────────────────────
 
     def _empty_path(self):
         p = Path()
         p.header.frame_id = "rtk_odom"
         return p
 
-    def _ros_now_from_log_t(self, log_t: float):
-        """Usa el tiempo del log como stamp (para que RViz muestre el tiempo real del vuelo)."""
-        return float_to_ros_time(log_t)
-
     def _publish_drone(self, ns: str, x: float, y: float, z: float,
                        quat: Quaternion, stamp: RosTime):
-        pubs  = self.pubs[ns]
-        color = pubs["color"]
+        p = self.pubs[ns]
 
-        # ── TF base_link ──────────────────────────────────────────────────────
+        # TF base_link
         tf = TransformStamped()
-        tf.header.stamp          = stamp
-        tf.header.frame_id       = "rtk_odom"
-        tf.child_frame_id        = f"{ns}_base_link"
+        tf.header.stamp        = stamp
+        tf.header.frame_id     = "rtk_odom"
+        tf.child_frame_id      = f"{ns}_base_link"
         tf.transform.translation.x = x
         tf.transform.translation.y = y
         tf.transform.translation.z = z
-        tf.transform.rotation       = quat
+        tf.transform.rotation      = quat
         self.tf_br.sendTransform(tf)
 
-        # ── TF base_footprint ─────────────────────────────────────────────────
+        # TF base_footprint
         tf2 = TransformStamped()
-        tf2.header.stamp          = stamp
-        tf2.header.frame_id       = "rtk_odom"
-        tf2.child_frame_id        = f"{ns}_base_footprint"
+        tf2.header.stamp        = stamp
+        tf2.header.frame_id     = "rtk_odom"
+        tf2.child_frame_id      = f"{ns}_base_footprint"
         tf2.transform.translation.x = x
         tf2.transform.translation.y = y
         tf2.transform.translation.z = 0.0
         tf2.transform.rotation.w    = 1.0
         self.tf_br.sendTransform(tf2)
 
-        # ── Odometry ──────────────────────────────────────────────────────────
+        # Odometry
         odom = Odometry()
-        odom.header.stamp    = stamp
-        odom.header.frame_id = "rtk_odom"
-        odom.child_frame_id  = f"{ns}_base_link"
-        odom.pose.pose.position.x    = x
-        odom.pose.pose.position.y    = y
-        odom.pose.pose.position.z    = z
-        odom.pose.pose.orientation   = quat
-        pubs["odom"].publish(odom)
+        odom.header.stamp       = stamp
+        odom.header.frame_id    = "rtk_odom"
+        odom.child_frame_id     = f"{ns}_base_link"
+        odom.pose.pose.position.x   = x
+        odom.pose.pose.position.y   = y
+        odom.pose.pose.position.z   = z
+        odom.pose.pose.orientation  = quat
+        p["odom"].publish(odom)
 
-        # ── Path ──────────────────────────────────────────────────────────────
+        # Path
         if self.publish_path:
             ps = PoseStamped()
             ps.header = odom.header
             ps.pose   = odom.pose.pose
-            pubs["path_msg"].header.stamp = stamp
-            pubs["path_msg"].poses.append(ps)
-            pubs["path"].publish(pubs["path_msg"])
+            p["path_msg"].header.stamp = stamp
+            p["path_msg"].poses.append(ps)
+            p["path"].publish(p["path_msg"])
 
-        # ── Marker texto ──────────────────────────────────────────────────────
+        # Marker texto
         text = Marker()
-        text.header    = odom.header
-        text.ns        = f"{ns}_text"
-        text.id        = 0
-        text.type      = Marker.TEXT_VIEW_FACING
-        text.action    = Marker.ADD
-        text.pose.position.x = x
-        text.pose.position.y = y
-        text.pose.position.z = z + 0.8
+        text.header = odom.header
+        text.ns     = f"{ns}_text"
+        text.id     = 0
+        text.type   = Marker.TEXT_VIEW_FACING
+        text.action = Marker.ADD
+        text.pose.position.x  = x
+        text.pose.position.y  = y
+        text.pose.position.z  = z + 0.8
         text.pose.orientation.w = 1.0
         text.scale.z = 0.4
         text.color   = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
         text.text    = f"{ns}: x={x:.2f}  y={y:.2f}  z={z:.2f}"
-        pubs["marker"].publish(text)
+        p["marker"].publish(text)
 
-        # ── Marker esfera (elipsoide de posición) ─────────────────────────────
+        # Marker esfera
         ell = Marker()
         ell.header = odom.header
         ell.ns     = f"{ns}_ellipse"
         ell.id     = 1
         ell.type   = Marker.SPHERE
         ell.action = Marker.ADD
-        ell.pose.position.x = x
-        ell.pose.position.y = y
-        ell.pose.position.z = z
+        ell.pose.position.x  = x
+        ell.pose.position.y  = y
+        ell.pose.position.z  = z
         ell.pose.orientation.w = 1.0
         ell.scale.x = 2.0 * ELLIPSE_SCALE_XY
         ell.scale.y = 2.0 * ELLIPSE_SCALE_XY
         ell.scale.z = 2.0 * ELLIPSE_SCALE_Z
-        ell.color   = COLOR_ELLIPSE
-        # Tint según dron: líder verde, seguidor naranja
-        if ns == "uav1":
-            ell.color = ColorRGBA(r=0.0, g=0.8, b=0.2, a=0.30)
-        else:
-            ell.color = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.30)
-        pubs["marker"].publish(ell)
+        ell.color   = p["ell_color"]
+        p["marker"].publish(ell)
 
-    # ── Timer callback ────────────────────────────────────────────────────────
+    # ── hilo de reproducción ──────────────────────────────────────────────────
 
-    def _step_cb(self):
-        if not self._replay_active:
-            return
+    def _replay_loop(self):
+        df     = self.df
+        t_arr  = df["t"].values
+        n      = len(df)
 
-        df   = self.df
-        n    = len(df)
+        def _get_quat(row, pfx):
+            q = Quaternion()
+            q.w = 1.0
+            for field, col in [("x", f"{pfx}_qx"), ("y", f"{pfx}_qy"),
+                                ("z", f"{pfx}_qz"), ("w", f"{pfx}_qw")]:
+                if col in df.columns:
+                    v = row[col]
+                    if not (isinstance(v, float) and math.isnan(v)):
+                        setattr(q, field, float(v))
+            return q
 
-        if self.idx >= n:
-            if self.loop:
-                self.get_logger().info("[Replay] Reiniciando (--loop)…")
-                self.idx = 0
-                for ns in self.pubs:
-                    self.pubs[ns]["path_msg"] = self._empty_path()
-                self._wall_origin  = None
-                self._log_t_origin = None
-                return
-            else:
+        def _safe(v):
+            return float(v) if not (isinstance(v, float) and math.isnan(v)) else 0.0
+
+        while not self._stop_event.is_set():
+            # ── Origen de tiempo para esta pasada ────────────────────────────
+            wall_origin  = time.perf_counter()
+            log_t_origin = float(t_arr[0])
+
+            for idx in range(n):
+                if self._stop_event.is_set():
+                    return
+
+                log_t    = float(t_arr[idx])
+                # Momento en que este sample debería publicarse
+                deadline = wall_origin + (log_t - log_t_origin) / self.speed
+
+                # Dormir exactamente hasta el deadline
+                remaining = deadline - time.perf_counter()
+                if remaining > 0:
+                    time.sleep(remaining)
+
+                row = df.iloc[idx]
+                lx  = _safe(row["L_rx"])
+                ly  = _safe(row["L_ry"])
+                lz  = _safe(row["L_cz"])
+                sx  = _safe(row["S_rx"])
+                sy  = _safe(row["S_ry"])
+                sz  = _safe(row["S_cz"])
+
+                stamp = secs_to_ros_time(log_t)
+                self._publish_drone("uav1", lx, ly, lz, _get_quat(row, "L"), stamp)
+                self._publish_drone("uav2", sx, sy, sz, _get_quat(row, "S"), stamp)
+
+                if idx % 200 == 0:
+                    elapsed_wall = time.perf_counter() - wall_origin
+                    elapsed_log  = log_t - log_t_origin
+                    self.get_logger().info(
+                        f"[Replay] log_t={log_t:.1f}s  "
+                        f"wall={elapsed_wall:.1f}s  "
+                        f"fase={row.get('phase','?')}  "
+                        f"L=({lx:.2f},{ly:.2f},{lz:.2f})  "
+                        f"S=({sx:.2f},{sy:.2f},{sz:.2f})"
+                    )
+
+            # Fin de pasada
+            if not self.loop:
                 self.get_logger().info("[Replay] Fin del log. Ctrl+C para salir.")
-                self._replay_active = False
-                self.timer.cancel()
                 return
 
-        wall = time.monotonic()
+            self.get_logger().info("[Replay] Reiniciando (--loop)…")
+            for ns in self.pubs:
+                self.pubs[ns]["path_msg"] = self._empty_path()
 
-        # Fijar origen en el primer sample
-        if self._wall_origin is None:
-            self._wall_origin  = wall
-            self._log_t_origin = float(self.t_arr[self.idx])
-
-        # Publicar todos los samples que ya debieron haberse emitido
-        while self.idx < n:
-            log_t = float(self.t_arr[self.idx])
-            dt_log  = log_t - self._log_t_origin        # tiempo transcurrido en el log
-            dt_wall = time.monotonic() - self._wall_origin  # tiempo real transcurrido
-
-            if dt_wall < dt_log / self.speed:
-                break   # aún no toca este sample
-
-            row = df.iloc[self.idx]
-
-            lx = float(row["L_rx"]) if not np.isnan(row["L_rx"]) else 0.0
-            ly = float(row["L_ry"]) if not np.isnan(row["L_ry"]) else 0.0
-            lz = float(row["L_cz"]) if not np.isnan(row["L_cz"]) else 0.0
-            sx = float(row["S_rx"]) if not np.isnan(row["S_rx"]) else 0.0
-            sy = float(row["S_ry"]) if not np.isnan(row["S_ry"]) else 0.0
-            sz = float(row["S_cz"]) if not np.isnan(row["S_cz"]) else 0.0
-
-            def get_quat(pfx):
-                q = Quaternion()
-                q.w = 1.0
-                for field, col in [("x", f"{pfx}_qx"), ("y", f"{pfx}_qy"),
-                                    ("z", f"{pfx}_qz"), ("w", f"{pfx}_qw")]:
-                    if col in df.columns and not np.isnan(row[col]):
-                        setattr(q, field, float(row[col]))
-                return q
-
-            stamp = self._ros_now_from_log_t(log_t)
-            self._publish_drone("uav1", lx, ly, lz, get_quat("L"), stamp)
-            self._publish_drone("uav2", sx, sy, sz, get_quat("S"), stamp)
-
-            if self.idx % 200 == 0:
-                self.get_logger().info(
-                    f"[Replay] t={log_t:.1f} s  idx={self.idx}/{n}  "
-                    f"fase={row.get('phase','?')}  "
-                    f"L=({lx:.2f},{ly:.2f},{lz:.2f})  S=({sx:.2f},{sy:.2f},{sz:.2f})"
-                )
-
-            self.idx += 1
+    def stop(self):
+        self._stop_event.set()
+        self._thread.join(timeout=2.0)
 
 
 # =============================================================================
-# ── MAIN ──────────────────────────────────────────────────────────────────────
+# MAIN
 # =============================================================================
 
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--master",   default=CSV_FILE,
+    ap.add_argument("--master",  default=CSV_FILE,
                     help=f"CSV de telemetría (default: {CSV_FILE})")
-    ap.add_argument("--speed",    type=float, default=1.0,
-                    help="Factor de velocidad (1.0 = tiempo real, 2.0 = doble, 0 = paso a paso)")
-    ap.add_argument("--loop",     action="store_true",
+    ap.add_argument("--speed",   type=float, default=1.0,
+                    help="Factor de velocidad (1.0=tiempo real, 2.0=doble, 0.5=mitad)")
+    ap.add_argument("--loop",    action="store_true",
                     help="Repetir el log al terminar")
-    ap.add_argument("--no-path",  action="store_true",
-                    help="No publicar Path (útil para logs muy largos)")
+    ap.add_argument("--no-path", action="store_true",
+                    help="No publicar Path")
     ap.add_argument("--ox",  type=float, default=None)
     ap.add_argument("--oy",  type=float, default=None)
     ap.add_argument("--ozl", type=float, default=None)
@@ -480,32 +437,17 @@ def main():
         sys.exit(1)
 
     rclpy.init()
-
-    if args.speed == 0:
-        # Modo paso a paso interactivo
-        node = LogReplayNode(df, speed=0, loop=args.loop,
-                             publish_path=not args.no_path)
-        print("\n[Paso-a-paso] Pulsa Enter para publicar cada muestra. Ctrl+C para salir.\n")
-        try:
-            while rclpy.ok() and node._replay_active:
-                input()        # espera Enter
-                node._wall_origin  = None   # reinicia origen para no esperar en paso-a-paso
-                node._log_t_origin = None
-                node._step_cb()
-                rclpy.spin_once(node, timeout_sec=0.01)
-        except KeyboardInterrupt:
-            pass
-    else:
-        node = LogReplayNode(df, speed=args.speed, loop=args.loop,
-                             publish_path=not args.no_path)
-        try:
-            rclpy.spin(node)
-        except KeyboardInterrupt:
-            pass
-
-    node.destroy_node()
-    rclpy.shutdown()
-    print("\n✅ Replay terminado.")
+    node = LogReplayNode(df, speed=args.speed, loop=args.loop,
+                         publish_path=not args.no_path)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.stop()
+        node.destroy_node()
+        rclpy.shutdown()
+        print("\n✅ Replay terminado.")
 
 
 if __name__ == "__main__":
