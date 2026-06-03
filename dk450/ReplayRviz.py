@@ -273,10 +273,14 @@ class LogReplayNode(Node):
         # Path
         # Path — solo 1 de cada path_decim muestras para evitar serialización cuadrática
         self._frame_count += 1
+
         if self.publish_path and (self._frame_count % self.path_decim == 0):
             ps = PoseStamped(); ps.header=odom.header; ps.pose=odom.pose.pose
             pm = p["path_msg"]; pm.header.stamp=stamp; pm.poses.append(ps)
+            if len(pm.poses) > 500:
+                pm.poses = pm.poses[-500:]
             p["path"].publish(pm)
+
 
         # Marker texto
         mk = Marker(); mk.header=odom.header
