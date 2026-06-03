@@ -197,7 +197,8 @@ class LogReplayNode(Node):
         self.phases = df["phase"].values
 
         def _arr(col):
-            v = df[col].values.astype(float)
+            s = df[col].interpolate(method="linear", limit_direction="both").ffill().bfill()
+            v = s.values.astype(float)
             v[np.isnan(v)] = 0.0
             return v
 
