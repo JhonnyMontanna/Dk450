@@ -191,6 +191,8 @@ class LogReplayNode(Node):
         self.path_decim   = 10  # publicar path 1 de cada N muestras
         self._frame_count = 0
 
+        self._last_phase = {"uav1": None, "uav2": None}
+
         # Pre-extraer arrays numpy para acceso O(1) sin iloc
         self.t_arr  = df["t"].values.astype(float)
         self.n      = len(self.t_arr)
@@ -241,7 +243,8 @@ class LogReplayNode(Node):
 
     # ── publicación de un frame ───────────────────────────────────────────────
 
-    def _pub_frame(self, ns, x, y, z, qx, qy, qz, qw, stamp):
+
+    def _pub_frame(self, ns, x, y, z, qx, qy, qz, qw, stamp, idx=0):
         p = self.pubs[ns]
 
         q = Quaternion(); q.x=qx; q.y=qy; q.z=qz; q.w=qw
@@ -274,13 +277,24 @@ class LogReplayNode(Node):
         # Path — solo 1 de cada path_decim muestras para evitar serialización cuadrática
         self._frame_count += 1
 
-        if self.publish_path and (self._frame_count % self.path_decim == 0):
-            ps = PoseStamped(); ps.header=odom.header; ps.pose=odom.pose.pose
-            pm = p["path_msg"]; pm.header.stamp=stamp; pm.poses.append(ps)
-            if len(pm.poses) > 500:
-                pm.poses = pm.poses[-500:]
-            p["path"].publish(pm)
+    
 
+        if self.publish_path:
+            current_phase = self.phases[idx]
+            if current_phase != self._last_phase[ns]:
+                # Fase nueva: borrar path anterior con DELETE y reiniciar
+                del_path = self._mk_path()
+                del_path.header.stamp = stamp
+                p["path"].publish(del_path)
+                p["path_msg"] = self._mk_path()
+                self._last_phase[ns] = current_phase
+
+            if self._frame_count % self.path_decim == 0:
+                ps = PoseStamped(); ps.header=odom.header; ps.pose=odom.pose.pose
+                pm = p["path_msg"]; pm.header.stamp=stamp; pm.poses.append(ps)
+                if len(pm.poses) > 500:
+                    pm.poses = pm.poses[-500:]
+                p["path"].publish(pm)
 
         # Marker texto
         mk = Marker(); mk.header=odom.header
@@ -325,14 +339,16 @@ class LogReplayNode(Node):
                     time.sleep(remaining)
 
                 stamp = self.get_clock().now().to_msg()
+           
+
                 self._pub_frame("uav1",
                                 self.lx[i], self.ly[i], self.lz[i],
                                 self.lqx[i], self.lqy[i], self.lqz[i], self.lqw[i],
-                                stamp)
+                                stamp, idx=i)
                 self._pub_frame("uav2",
                                 self.sx[i], self.sy[i], self.sz[i],
                                 self.sqx[i], self.sqy[i], self.sqz[i], self.sqw[i],
-                                stamp)
+                                stamp, idx=i)
 
                 if i % 50 == 0:
                     wall_elapsed = time.perf_counter() - wall_t0
