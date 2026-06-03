@@ -275,7 +275,7 @@ class LogReplayNode(Node):
 
         # Path
         # Path — solo 1 de cada path_decim muestras para evitar serialización cuadrática
-        self._frame_count += 1
+      #  self._frame_count += 1
 
     
 
@@ -289,7 +289,7 @@ class LogReplayNode(Node):
                 p["path_msg"] = self._mk_path()
                 self._last_phase[ns] = current_phase
 
-            if self._frame_count % self.path_decim == 0:
+            if idx % self.path_decim == 0:
                 ps = PoseStamped(); ps.header=odom.header; ps.pose=odom.pose.pose
                 pm = p["path_msg"]; pm.header.stamp=stamp; pm.poses.append(ps)
                 if len(pm.poses) > 500:
@@ -349,6 +349,8 @@ class LogReplayNode(Node):
                                 self.sx[i], self.sy[i], self.sz[i],
                                 self.sqx[i], self.sqy[i], self.sqz[i], self.sqw[i],
                                 stamp, idx=i)
+                self._frame_count += 1  # ← agregar aquí
+
 
                 if i % 50 == 0:
                     wall_elapsed = time.perf_counter() - wall_t0
